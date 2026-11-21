@@ -25,6 +25,17 @@ export interface BookReadingSession {
   // How the session was spent: reading the text, listening to text to speech, or listening to
   // audio. Optional because servers before this field omit it; clients fall back to the format.
   sessionType?: ReadingSessionType;
+  // The KOReader device that recorded the session, when it can be told. Null for other sources,
+  // and optional because servers before this field omit it.
+  device?: BookReadingSessionDevice | null;
+}
+
+export interface BookReadingSessionDevice {
+  deviceId: string;
+  // The model the device reports, as the KOReader device settings list it.
+  model: string | null;
+  // The name the user gave the device.
+  name: string | null;
 }
 
 export interface BookReadingSourceSlice {
@@ -39,12 +50,14 @@ export interface BookReadingSessionStats {
   avgDurationSeconds: number;
   firstSessionAt: string | null;
   lastSessionAt: string | null;
+  // Most recent recorded session start or saved reading progress for the book, independent of list filters.
+  lastReadAt?: string | null;
   dailySummary: { day: string; totalMinutes: number }[];
   paceProgressDelta: number;
   paceDurationSeconds: number;
   progressSummary: { day: string; endProgress: number }[];
   // endProgress of the most recently ended session that recorded one, or null when no
-  // session has. Unlike every other field here it ignores the list filters, because it
+  // session has. This ignores the list filters, because it
   // feeds the book's progress ring rather than a summary of the filtered rows.
   latestEndProgress: number | null;
   // Reading time/sessions split across the display buckets, ordered by

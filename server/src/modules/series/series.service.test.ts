@@ -225,6 +225,36 @@ describe('SeriesService', () => {
       expect(item.volumesTruncated).toBe(true);
       expect(item.gapCount).toBe(0);
       expect(item.nextBookId).toBe(31);
+      expect(item).toMatchObject({ ownedVolumeCount: 900, readVolumeCount: 0, readingVolumeCount: 0 });
+    });
+
+    it('reports the true volume counts for a series longer than the ladder cap', async () => {
+      seriesRepo.findPage.mockResolvedValue({
+        items: [
+          summaryRow({
+            id: 10,
+            name: 'Hellblazer',
+            bookCount: 300,
+            readCount: 60,
+            members: Array.from({ length: 300 }, (_, i) => ({
+              bookId: 100 + i,
+              seriesIndex: String(i + 1),
+              title: `Issue ${i + 1}`,
+              status: i < 60 ? 'read' : null,
+            })),
+          }),
+        ],
+        total: 1,
+        facets: { ...EMPTY_FACETS, all: 1, inProgress: 1 },
+        page: 0,
+        size: 50,
+      });
+
+      const item = (await service.findAll(reqUser(), {})).items[0]!;
+
+      expect(item.volumes).toHaveLength(60);
+      expect(item.volumesTruncated).toBe(true);
+      expect(item).toMatchObject({ ownedVolumeCount: 300, readVolumeCount: 60, readingVolumeCount: 0 });
     });
 
     it('scopes to specific library when libraryId provided', async () => {
@@ -498,6 +528,57 @@ describe('SeriesService', () => {
       seriesRepo.findBookIds.mockResolvedValue({ bookIds: [], total: 0 });
 
       await expect(service.findBooks(reqUser(), 42, {})).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('libraries hidden from Series', () => {
+    const hidingUser = () => ({ ...reqUser(), settings: { libraryVisibility: { hidden: { series: [2] } } } });
+    const dune = { id: 42, name: 'Dune', bookCount: 1, readCount: 0, authors: [], indices: ['1'] };
+
+    it('lists series from shown libraries only', async () => {
+      seriesRepo.findPage.mockResolvedValue({ items: [], total: 0, facets: EMPTY_FACETS, page: 0, size: 50 });
+
+      await service.findAll(hidingUser(), {});
+
+      expect(seriesRepo.findPage).toHaveBeenCalledWith(expect.objectContaining({ libraryIds: [1] }));
+    });
+
+    it('still lists a hidden library picked in the library filter', async () => {
+      seriesRepo.findPage.mockResolvedValue({ items: [], total: 0, facets: EMPTY_FACETS, page: 0, size: 50 });
+
+      await service.findAll(hidingUser(), { libraryId: 2 });
+
+      expect(seriesRepo.findPage).toHaveBeenCalledWith(expect.objectContaining({ libraryIds: [2] }));
+    });
+
+    it('counts series the way the Series page lists them', async () => {
+      seriesRepo.countSeries.mockResolvedValue(3);
+
+      await service.countAll(hidingUser());
+
+      expect(seriesRepo.countSeries).toHaveBeenCalledWith(expect.objectContaining({ libraryIds: [1] }));
+    });
+
+    it('shows a mixed series with the books from shown libraries', async () => {
+      seriesRepo.findDetail.mockResolvedValue(dune);
+      seriesRepo.findBookIds.mockResolvedValue({ bookIds: [], total: 0 });
+
+      await service.findBooks(hidingUser(), 42, {});
+
+      expect(seriesRepo.findDetail).toHaveBeenCalledTimes(1);
+      expect(seriesRepo.findDetail).toHaveBeenCalledWith(expect.objectContaining({ libraryIds: [1] }));
+      expect(seriesRepo.findBookIds).toHaveBeenCalledWith(expect.objectContaining({ libraryIds: [1] }));
+    });
+
+    it('opens a series kept only in hidden libraries with all its books', async () => {
+      seriesRepo.findDetail.mockResolvedValueOnce(null).mockResolvedValueOnce(dune);
+      seriesRepo.findBookIds.mockResolvedValue({ bookIds: [], total: 0 });
+
+      const result = await service.findBooks(hidingUser(), 42, {});
+
+      expect(result.seriesInfo.name).toBe('Dune');
+      expect(seriesRepo.findDetail).toHaveBeenLastCalledWith(expect.objectContaining({ libraryIds: [1, 2] }));
+      expect(seriesRepo.findBookIds).toHaveBeenLastCalledWith(expect.objectContaining({ libraryIds: [1, 2] }));
     });
   });
 

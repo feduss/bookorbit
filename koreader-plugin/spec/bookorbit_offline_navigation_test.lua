@@ -68,7 +68,6 @@ function catalog:runConnected(fn) waited = waited + 1; fn() end
 function catalog:refreshOnDevice() return true end
 function catalog:isOnDevice(book) return self.on_device[book.id] ~= nil end
 function catalog:fetchBookPage(params, title, push) table.insert(fetched, { params = params, title = title, push = push }) end
-function catalog:loadNotOnDevice() table.insert(fetched, { not_on_device = true }) end
 function catalog:persistSetting() end
 local offline_answer = true
 function catalog:offlineServeBooks(params, title, push)
@@ -102,8 +101,8 @@ assertEqual(fetched[1].params.ids, "2,5,7", "for the books on the device, within
 assertEqual(waited, 1, "through the connected gate")
 
 -- A list the device derived, reloaded online, is rebuilt rather than sent.
-catalog:loadBooks({ sort = "recently_added", not_on_device = true }, "Not on device", false, { online = true })
-assertEqual(fetched[2].not_on_device, true, "Not on device goes back through its own walk")
+catalog:loadBooks({ sort = "recently_added", not_on_device_filter = true }, "Library", false, { online = true })
+assertEqual(fetched[2].params.not_on_device_filter, true, "Not on this device keeps its filter; the exclusion is read at fetch time")
 catalog:loadBooks({ sort = "title", on_device_filter = true, ids = { 2, 5, 7, 9 } }, "On device", false, { online = true })
 assertEqual(fetched[3].params.ids, "2,5,7", "On device sends the capped ids, never the offline table")
 
@@ -127,7 +126,7 @@ catalog:loadShelves({ online = true, replace = true })
 assertEqual(#served, 2, "unless reconnecting")
 catalog:listSearch("dune", {})
 assertEqual(served[3].q, "dune", "search is served offline")
-assertEqual(waited, 5, "only the server-bound loads waited for a connection")
+assertEqual(waited, 6, "only the server-bound loads waited for a connection")
 
 -- Applying the sort sheet offline reloads through the offline library.
 catalog.current_context = { kind = "books", params = { sort = "title" }, title = "All books",

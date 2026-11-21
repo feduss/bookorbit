@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import type { BookCard, BookFileRef, CoverAspectRatio } from '@bookorbit/types'
-import { getBookMediaProfile, isAudioFormat, READER_OPENABLE_FORMATS } from '@bookorbit/types'
-import BookFormatChip from './BookFormatChip.vue'
+import type { BookCard, BookFileRef, ConcreteBookMediaKind, CoverAspectRatio } from '@bookorbit/types'
+import { getBookMediaKind, getBookMediaProfile, isAudioFormat, READER_OPENABLE_FORMATS } from '@bookorbit/types'
+import BookCardFormatBadges from './BookCardFormatBadges.vue'
+import BookCardFormatList from './BookCardFormatList.vue'
 import { bookFormatEntries, fileFormatKey, formatKeyName } from '../lib/book-formats'
+import { cardMediaView } from '../lib/card-media'
 import { computed, inject, ref, watch, onMounted, onUnmounted } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type RouteLocationRaw } from 'vue-router'
 import {
   BookOpen,
   BookText,
   Check,
   Download,
+  ExternalLink,
   Eye,
   FolderInput,
   FolderPlus,
@@ -55,11 +58,14 @@ import BookCoverSurface from './BookCoverSurface.vue'
 import { fetchAuthors } from '@/features/author/api/author'
 import { useI18n } from 'vue-i18n'
 import { toast } from 'vue-sonner'
+import ActivateLink from '@/components/ActivateLink.vue'
+import { useOpenInNewTab } from '@/composables/useOpenInNewTab'
 
 const { t } = useI18n()
 
 const route = useRoute()
 const router = useRouter()
+const { openInNewTab, openInNewTabIfRequested } = useOpenInNewTab()
 
 const props = defineProps<{
   book: BookCard
@@ -69,6 +75,8 @@ const props = defineProps<{
   coverAspectRatio?: CoverAspectRatio
   /** Opt-in: only views that host the destination sheet should offer this. */
   allowMoveToLibrary?: boolean
+  /** The medium the surrounding grid shows, such as a series' Audiobooks group. */
+  mediaKind?: ConcreteBookMediaKind | null
 }>()
 
 type BookActionType = 'quick-view' | 'add-to-collection' | 'move-to-library' | 'delete'
@@ -86,17 +94,34 @@ const formatEntries = computed(() => bookFormatEntries(props.book.files))
 /** One file per edition: an audiobook downloads as a whole and opens from its first track. */
 const downloadableFiles = computed(() => formatEntries.value.map((entry) => entry.files[0]!))
 const openableFiles = computed(() => downloadableFiles.value.filter((file) => READER_OPENABLE_FORMATS.has(file.format!.toLowerCase())))
-const primaryFile = computed(() => openableFiles.value.find((f) => f.role === 'primary') ?? openableFiles.value[0] ?? null)
+const mediaView = computed(() => cardMediaView(props.book, props.mediaKind))
+const primaryFile = computed(() => {
+  const kind = mediaView.value?.kind
+  const fileOfKind = kind ? openableFiles.value.find((f) => getBookMediaKind(f.format) === kind) : undefined
+  return fileOfKind ?? openableFiles.value.find((f) => f.role === 'primary') ?? openableFiles.value[0] ?? null
+})
 const primaryDownloadFile = computed(() => downloadableFiles.value[0] ?? null)
 const mediaProfile = computed(() => getBookMediaProfile(formatEntries.value.flatMap((entry) => entry.files)))
-const formatOverlayKey = computed(() => formatEntries.value[0]?.key ?? null)
-const isAudiobook = computed(() => mediaProfile.value.primaryMediaKind === 'audiobook')
-const isComic = computed(() => mediaProfile.value.primaryMediaKind === 'comic')
+const formatOverlayKey = computed(() => {
+  const kind = mediaView.value?.kind
+  const entry = kind ? formatEntries.value.find((e) => getBookMediaKind(e.files[0]?.format) === kind) : formatEntries.value[0]
+  return entry?.key ?? null
+})
+/** Every edition the card offers, the one its media view leads with first; linked formats follow. */
+const ownFormatKeys = computed(() => {
+  const keys = formatEntries.value.map((entry) => entry.key)
+  const lead = formatOverlayKey.value
+  return lead ? [lead, ...keys.filter((key) => key !== lead)] : keys
+})
+const hasFormatBadges = computed(() => ownFormatKeys.value.length > 0 || (props.book.linked?.books.length ?? 0) > 0)
+const displayMediaKind = computed(() => mediaView.value?.kind ?? mediaProfile.value.primaryMediaKind)
+const isAudiobook = computed(() => displayMediaKind.value === 'audiobook')
+const isComic = computed(() => displayMediaKind.value === 'comic')
 
 const isMultiTrackAudio = computed(() => formatEntries.value.some((entry) => entry.audio && entry.files.length > 1))
 
 const { coverUrl, bumpVersion } = useCoverVersions()
-const coverSrc = computed(() => coverUrl(props.book.id, 'thumbnail', props.book.coverVersion))
+const coverSrc = computed(() => coverUrl(props.book.id, 'thumbnail', props.book.coverVersion, mediaView.value?.coverMedium))
 
 const { refreshing, refreshWithFeedback } = useRefreshMetadata()
 const { isRefreshing } = useRefreshingBooks()
@@ -127,16 +152,19 @@ async function handleRefreshMetadata() {
 const { hasPermission } = usePermissions()
 const { hasLibraryPermission } = useLibraryPermissions()
 const canEditMetadata = computed(() => hasLibraryPermission('library_edit_metadata', props.book?.libraryId, 'editor'))
-const { cardOverlays, bookCoverDisplayMode, gridCardPrimaryLabel, gridCardSecondaryLabel, cardInfoMode, thumbnailClickAction } = useDisplaySettings()
+const { cardOverlays, formatBadgeStyle, bookCoverDisplayMode, gridCardPrimaryLabel, gridCardSecondaryLabel, cardInfoMode, thumbnailClickAction } =
+  useDisplaySettings()
 const injectedCoverAspectRatio = inject(COVER_ASPECT_RATIO_KEY, ref(DEFAULT_COVER_ASPECT_RATIO))
 const effectiveCoverAspectRatio = computed<CoverAspectRatio>(
-  () => props.coverAspectRatio ?? props.book.coverAspectRatio ?? injectedCoverAspectRatio.value,
+  () => props.coverAspectRatio ?? mediaView.value?.coverAspectRatio ?? props.book.coverAspectRatio ?? injectedCoverAspectRatio.value,
 )
 const showSendDialog = ref(false)
 
 const hasProgress = computed(() => props.book.readingProgress != null && props.book.readingProgress > 0)
 const showProgressBar = computed(() => cardOverlays.value.includes('progress-bar') && hasProgress.value)
-const showFormatOverlay = computed(() => cardOverlays.value.includes('format') && formatOverlayKey.value != null)
+const showFormatOverlay = computed(() => cardOverlays.value.includes('format') && hasFormatBadges.value)
+/** Every badge style but the plain pill hides which formats a book has, so the hover overlay lists them. */
+const showFormatList = computed(() => showFormatOverlay.value && formatBadgeStyle.value !== 'primary')
 const showRatingOverlay = computed(() => cardOverlays.value.includes('rating') && props.book.rating != null)
 const showLockStatusPill = computed(() => cardOverlays.value.includes('lock-status') && !props.selectionMode && !isMissing.value)
 const metadataLocked = computed(() => props.book.hasMetadataLocks)
@@ -197,12 +225,21 @@ function handleArtworkError() {
   coverImageRatio.value = null
 }
 
-function openFile(file: BookFileRef, mode?: 'peek') {
-  router.push({
+const detailsLocation = computed<RouteLocationRaw>(() => ({ name: 'book-detail', params: { bookId: props.book.id } }))
+const seriesLocation = computed<RouteLocationRaw | null>(() =>
+  props.book.seriesId == null ? null : { name: 'series-detail', params: { seriesId: props.book.seriesId }, query: { from: route.fullPath } },
+)
+
+function readerLocation(file: BookFileRef, mode?: 'peek'): RouteLocationRaw {
+  return {
     name: 'reader',
     params: { bookId: props.book.id, fileId: file.id },
     query: mode === 'peek' ? { format: file.format ?? 'epub', mode } : { format: file.format ?? 'epub' },
-  })
+  }
+}
+
+function openFile(file: BookFileRef, mode?: 'peek') {
+  router.push(readerLocation(file, mode))
 }
 
 function peekPrimaryFile() {
@@ -211,12 +248,16 @@ function peekPrimaryFile() {
 }
 
 function openBookDetails() {
-  void router.push({ name: 'book-detail', params: { bookId: props.book.id } })
+  void router.push(detailsLocation.value)
+}
+
+function openBookDetailsInNewTab() {
+  openInNewTab(detailsLocation.value)
 }
 
 function openSeriesDetails() {
-  if (props.book.seriesId == null) return
-  void router.push({ name: 'series-detail', params: { seriesId: props.book.seriesId }, query: { from: route.fullPath } })
+  if (seriesLocation.value == null) return
+  void router.push(seriesLocation.value)
 }
 
 async function openAuthorDetails() {
@@ -283,7 +324,21 @@ const readActionLabel = computed(() => {
 })
 const primaryOverlayActionLabel = computed(() => (thumbnailClickAction.value === 'details' ? t('book.actions.bookDetails') : readActionLabel.value))
 
-function handlePrimaryOverlayAction() {
+const primaryOverlayLocation = computed<RouteLocationRaw | null>(() => {
+  if (thumbnailClickAction.value === 'details') return detailsLocation.value
+  return primaryFile.value && !isMissing.value ? readerLocation(primaryFile.value) : null
+})
+/** Where a plain click on the card goes; touch screens use the first tap to reveal the overlay instead. */
+const cardLocation = computed<RouteLocationRaw | null>(() =>
+  isTouch.value && thumbnailClickAction.value !== 'details' ? null : primaryOverlayLocation.value,
+)
+const explicitReadLocation = computed<RouteLocationRaw | null>(() =>
+  primaryFile.value && !isMissing.value ? readerLocation(primaryFile.value) : null,
+)
+
+function handlePrimaryOverlayAction(event: MouseEvent) {
+  if (openInNewTabIfRequested(event, primaryOverlayLocation.value)) return
+
   if (thumbnailClickAction.value === 'details') {
     openBookDetails()
     return
@@ -292,7 +347,8 @@ function handlePrimaryOverlayAction() {
   if (primaryFile.value && !isMissing.value) openFile(primaryFile.value)
 }
 
-function openPrimaryFileExplicit() {
+function openPrimaryFileExplicit(event: MouseEvent) {
+  if (openInNewTabIfRequested(event, explicitReadLocation.value)) return
   if (primaryFile.value && !isMissing.value) openFile(primaryFile.value)
 }
 
@@ -303,6 +359,7 @@ function handleCardClick(event: MouseEvent) {
     emit('select', event)
     return
   }
+  if (openInNewTabIfRequested(event, cardLocation.value)) return
 
   if (thumbnailClickAction.value === 'details') {
     openBookDetails()
@@ -315,6 +372,20 @@ function handleCardClick(event: MouseEvent) {
   }
 
   if (primaryFile.value && !isMissing.value) openFile(primaryFile.value)
+}
+
+function handleCardAuxClick(event: MouseEvent) {
+  const target = event.target
+  if (target instanceof Element && target.closest('button, [data-card-click-blocker]')) return
+  if (props.selectionMode) return
+  openInNewTabIfRequested(event, cardLocation.value)
+}
+
+/** The browser's own menu is what offers "Open link in new tab", so it stays on links and is suppressed elsewhere on the card. */
+function handleContextMenu(event: MouseEvent) {
+  const target = event.target
+  if (target instanceof Element && target.closest('a[href]')) return
+  event.preventDefault()
 }
 
 function handleClickOutside(event: MouseEvent) {
@@ -412,6 +483,15 @@ function resolveBookLabel(field: GridCardLabelField): string | null {
 
 const primaryLabelText = computed(() => resolveBookLabel(gridCardPrimaryLabel.value))
 const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabel.value))
+
+function resolveLabelLocation(field: GridCardLabelField): RouteLocationRaw | null {
+  if (field === 'book-title') return detailsLocation.value
+  if (field === 'series-title' || field === 'series-title-position') return seriesLocation.value
+  return null
+}
+
+const primaryLabelLocation = computed(() => (props.selectionMode ? null : resolveLabelLocation(gridCardPrimaryLabel.value)))
+const secondaryLabelLocation = computed(() => (props.selectionMode ? null : resolveLabelLocation(gridCardSecondaryLabel.value)))
 </script>
 
 <template>
@@ -420,7 +500,8 @@ const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabe
     class="flex flex-col @container touch-manipulation"
     :class="[selectionMode || isPrimaryClickAvailable ? 'cursor-pointer' : 'cursor-default', selectionMode ? 'select-none' : '']"
     @click="handleCardClick"
-    @contextmenu.prevent
+    @auxclick="handleCardAuxClick"
+    @contextmenu="handleContextMenu"
   >
     <!-- Cover -->
     <div class="group">
@@ -502,17 +583,13 @@ const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabe
             <span class="text-[9px] font-bold text-white leading-none">{{ Math.round(book.rating!) }}</span>
           </div>
 
-          <!-- Bottom-right overlay: format badge -->
+          <!-- Bottom-right overlay: the format badge, in the style the user chose; it places itself -->
           <div
             v-if="showFormatOverlay && !selectionMode"
-            class="absolute bottom-1.5 right-1.5 z-10 flex items-center gap-0.5 pointer-events-none transition-opacity duration-150"
+            class="absolute inset-0 z-10 pointer-events-none transition-opacity duration-150"
             :class="overlayFadeClass"
           >
-            <BookFormatChip
-              :format-key="formatOverlayKey!"
-              variant="solid"
-              class="gap-0.5 rounded-xs px-1.5 py-0.5 text-[8px] font-semibold tracking-widest opacity-90"
-            />
+            <BookCardFormatBadges :own-keys="ownFormatKeys" :linked="book.linked" :badge-style="formatBadgeStyle" />
           </div>
 
           <!-- Reading progress bar - bottom edge -->
@@ -612,6 +689,7 @@ const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabe
 
             <!-- Bottom: title/author (hover-overlay mode only) + kebab (when not in below-cover label row) -->
             <div class="shrink-0 flex flex-col pr-10">
+              <BookCardFormatList v-if="showFormatList" class="mb-1" :own-keys="ownFormatKeys" :linked="book.linked" />
               <div class="flex items-start justify-between gap-2">
                 <p v-if="showHoverTitle" class="text-xs font-semibold text-white leading-tight min-w-0 flex-1" :class="hoverTitleClampClass">
                   {{ book.title ?? '-' }}
@@ -689,6 +767,10 @@ const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabe
                     <BookText class="size-4 mr-2" />
                     {{ t('book.actions.bookDetails') }}
                   </DropdownMenuItem>
+                  <DropdownMenuItem @click="openBookDetailsInNewTab">
+                    <ExternalLink class="size-4 mr-2" />
+                    {{ t('common.openInNewTab') }}
+                  </DropdownMenuItem>
                   <DropdownMenuSeparator v-if="canEditMetadata" />
                   <DropdownMenuSub v-if="canEditMetadata">
                     <DropdownMenuSubTrigger>
@@ -761,8 +843,17 @@ const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabe
     <!-- Below-cover label row (below-cover mode only) -->
     <div v-if="showBelowCoverLabelArea" class="grid-card-label" data-testid="grid-card-label">
       <div class="grid-card-label__primary-row">
+        <ActivateLink
+          v-if="primaryLabelText && primaryLabelLocation"
+          :to="primaryLabelLocation"
+          class="grid-card-label__button grid-card-label__primary min-w-0 flex-1 truncate"
+          data-testid="grid-card-label-primary"
+          @activate="handlePrimaryLabelClick"
+        >
+          {{ primaryLabelText }}
+        </ActivateLink>
         <button
-          v-if="primaryLabelText"
+          v-else-if="primaryLabelText"
           type="button"
           class="grid-card-label__button grid-card-label__primary min-w-0 flex-1 truncate"
           data-testid="grid-card-label-primary"
@@ -831,6 +922,10 @@ const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabe
               <BookText class="size-4 mr-2" />
               {{ t('book.actions.bookDetails') }}
             </DropdownMenuItem>
+            <DropdownMenuItem @click="openBookDetailsInNewTab">
+              <ExternalLink class="size-4 mr-2" />
+              {{ t('common.openInNewTab') }}
+            </DropdownMenuItem>
             <DropdownMenuSeparator v-if="canEditMetadata" />
             <DropdownMenuSub v-if="canEditMetadata">
               <DropdownMenuSubTrigger>
@@ -887,8 +982,17 @@ const secondaryLabelText = computed(() => resolveBookLabel(gridCardSecondaryLabe
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+      <ActivateLink
+        v-if="secondaryLabelText && secondaryLabelLocation"
+        :to="secondaryLabelLocation"
+        class="grid-card-label__button grid-card-label__secondary w-full"
+        data-testid="grid-card-label-secondary"
+        @activate="handleSecondaryLabelClick"
+      >
+        {{ secondaryLabelText }}
+      </ActivateLink>
       <button
-        v-if="secondaryLabelText"
+        v-else-if="secondaryLabelText"
         type="button"
         class="grid-card-label__button grid-card-label__secondary w-full"
         data-testid="grid-card-label-secondary"

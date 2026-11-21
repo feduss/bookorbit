@@ -20,9 +20,8 @@ vi.mock('@/components/ui/sheet', () => ({
 }))
 
 const LIBRARIES = [
-  { id: 1, name: 'Novels', type: 'books' as const, bookCount: 120 },
-  { id: 2, name: 'Comics', type: 'books' as const, bookCount: 30 },
-  { id: 3, name: 'Podcasts', type: 'podcasts' as const, bookCount: 0 },
+  { id: 1, name: 'Novels', bookCount: 120 },
+  { id: 2, name: 'Comics', bookCount: 30 },
 ]
 
 const USER = {
@@ -43,6 +42,8 @@ function jsonResponse(body: unknown) {
 
 function stubApi(overrides: { grants?: UserLibraryGrant[]; filters?: unknown } = {}) {
   apiMock.mockImplementation(async (input: string) => {
+    if (input === '/api/v1/api-keys/settings') return jsonResponse({ enabled: true, maxLifetimeDays: null })
+    if (input.endsWith('/api-keys')) return jsonResponse([])
     if (input.endsWith('/library-access')) return jsonResponse(overrides.grants ?? [{ libraryId: 1, accessLevel: 'viewer' }])
     if (input.endsWith('/content-filters')) {
       return jsonResponse(overrides.filters ?? { includeTags: [], excludeTags: [], includeGenres: [], excludeGenres: [] })
@@ -98,7 +99,7 @@ describe('UserFormDrawer sections', () => {
     const nav = wrapper.find('nav').text()
 
     expect(nav).toContain('Profile')
-    expect(nav).toContain('1 of 3')
+    expect(nav).toContain('1 of 2')
     expect(nav).toContain('2 granted')
     expect(nav).toContain('None')
   })
@@ -211,11 +212,11 @@ describe('UserFormDrawer permissions', () => {
       return id ? wrapper.find(`[id="${id}"]`) : undefined
     }
 
-    it('warns that the permission does nothing while every book library is Viewer only', async () => {
+    it('warns that the permission does nothing while every selected library is Viewer only', async () => {
       stubApi({
         grants: [
           { libraryId: 1, accessLevel: 'viewer' },
-          { libraryId: 3, accessLevel: 'owner' },
+          { libraryId: 2, accessLevel: 'viewer' },
         ],
       })
       const wrapper = await mountDrawer({ user: editor })
@@ -356,5 +357,38 @@ describe('UserFormDrawer saving', () => {
     await remove?.trigger('click')
 
     expect(wrapper.emitted('delete')).toHaveLength(1)
+  })
+})
+
+describe('UserFormDrawer API keys', () => {
+  it('offers the section only to someone allowed to manage keys, and never on a shared account', async () => {
+    expect((await mountDrawer()).find('nav').text()).not.toContain('API keys')
+    expect((await mountDrawer({ canManageApiKeys: true })).find('nav').text()).toContain('API keys')
+    expect((await mountDrawer({ canManageApiKeys: true, user: { ...USER, provisioningMethod: 'shared' } })).find('nav').text()).not.toContain(
+      'API keys',
+    )
+  })
+
+  it("keeps an administrator's keys away from a manager who is not one", async () => {
+    const admin = { ...USER, isSuperuser: true }
+    expect((await mountDrawer({ canManageApiKeys: true, user: admin })).find('nav').text()).not.toContain('API keys')
+    expect((await mountDrawer({ canManageApiKeys: true, canManageSuperuser: true, user: admin })).find('nav').text()).toContain('API keys')
+  })
+
+  it("lists the person's keys and says why none can be issued without the permission", async () => {
+    const wrapper = await mountDrawer({ canManageApiKeys: true })
+    await openSection(wrapper, 'API keys')
+
+    expect(apiMock).toHaveBeenCalledWith('/api/v1/users/7/api-keys', undefined)
+    expect(wrapper.find('[data-testid="api-keys-owner-not-permitted"]').exists()).toBe(true)
+    expect(wrapper.findAll('button').some((button) => button.text().includes('Issue key'))).toBe(false)
+  })
+
+  it('lets a key be issued once the person holds the permission', async () => {
+    const wrapper = await mountDrawer({ canManageApiKeys: true, user: { ...USER, permissions: [...USER.permissions, Permission.ApiKeys] } })
+    await openSection(wrapper, 'API keys')
+
+    expect(wrapper.find('[data-testid="api-keys-owner-not-permitted"]').exists()).toBe(false)
+    expect(wrapper.findAll('button').some((button) => button.text().includes('Issue key'))).toBe(true)
   })
 })

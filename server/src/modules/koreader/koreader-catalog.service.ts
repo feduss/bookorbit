@@ -81,7 +81,7 @@ import type {
 } from '../opds/opds-book.service';
 import { RecommendationService } from '../recommendation/recommendation.service';
 import { UserBookStatusService } from '../user-book-status/user-book-status.service';
-import { KoreaderCatalogBooksQueryDto, KoreaderCatalogManifestQueryDto } from './dto/koreader-catalog-query.dto';
+import { KoreaderCatalogBooksQueryDto, KoreaderCatalogBooksSearchDto, KoreaderCatalogManifestQueryDto } from './dto/koreader-catalog-query.dto';
 import { AppSettingsService } from '../app-settings/app-settings.service';
 import { KoreaderPluginService } from './koreader-plugin.service';
 import { KoreaderService } from './koreader.service';
@@ -153,6 +153,7 @@ const MANIFEST_CURSOR_CONTRACT_CHANGED = Symbol('manifest-cursor-contract-change
 const NATURAL_SORT_ORDER: Record<KoreaderCatalogSort, KoreaderCatalogSortOrder> = {
   title: 'asc',
   author: 'asc',
+  published: 'asc',
   series: 'asc',
   recently_added: 'desc',
   recently_updated: 'desc',
@@ -448,13 +449,13 @@ export class KoreaderCatalogService {
     }
   }
 
-  async getBooksPage(user: RequestUser, query: KoreaderCatalogBooksQueryDto): Promise<KoreaderCatalogPage<KoreaderCatalogBookListItem>> {
+  async getBooksPage(user: RequestUser, query: KoreaderCatalogBooksSearchDto): Promise<KoreaderCatalogPage<KoreaderCatalogBookListItem>> {
     return this.loadBooksPage(user, query, await this.resolveVisibility(user));
   }
 
   private async loadBooksPage(
     user: RequestUser,
-    query: KoreaderCatalogBooksQueryDto,
+    query: KoreaderCatalogBooksSearchDto,
     visibility: CatalogVisibility,
   ): Promise<KoreaderCatalogPage<KoreaderCatalogBookListItem>> {
     const size = query.size ?? 20;
@@ -1524,7 +1525,7 @@ export class KoreaderCatalogService {
   }
 
   private buildBookFilters(
-    query: KoreaderCatalogBooksQueryDto | KoreaderCatalogManifestQueryDto,
+    query: KoreaderCatalogBooksSearchDto | KoreaderCatalogManifestQueryDto,
     visibility: CatalogVisibility,
   ): {
     libraryId?: number;
@@ -1537,6 +1538,7 @@ export class KoreaderCatalogService {
     readStatus?: 'unread' | 'reading' | 'finished';
     format?: string;
     ids?: number[];
+    excludeIds?: number[];
     excludeAudioOnly?: boolean;
   } {
     return {
@@ -1551,6 +1553,7 @@ export class KoreaderCatalogService {
       ...(query.readStatus ? { readStatus: query.readStatus } : {}),
       ...(query.format?.trim() ? { format: query.format.trim().toLowerCase() } : {}),
       ...(query.ids ? { ids: query.ids } : {}),
+      ...('excludeIds' in query && query.excludeIds?.length ? { excludeIds: query.excludeIds } : {}),
     };
   }
 
@@ -1562,6 +1565,8 @@ export class KoreaderCatalogService {
         return descending ? 'title_desc' : 'title_asc';
       case 'author':
         return descending ? 'author_desc' : 'author_asc';
+      case 'published':
+        return descending ? 'published_desc' : 'published_asc';
       case 'recently_updated':
         return descending ? 'updated' : 'updated_asc';
       case 'recently_read':
@@ -1580,10 +1585,12 @@ export class KoreaderCatalogService {
     total: number,
     page: number,
     size: number,
-    query: KoreaderCatalogBooksQueryDto,
+    query: KoreaderCatalogBooksSearchDto,
     seriesSummary: KoreaderCatalogSeriesSummary | null = null,
     offset?: number,
   ): KoreaderCatalogPage<T> {
+    // A GET link cannot carry a body's exclusions, so following one would widen the list.
+    const linkable = !query.excludeIds?.length;
     if (offset !== undefined) {
       const hasNext = offset + size < total;
       const hasPrevious = offset > 0;
@@ -1595,8 +1602,8 @@ export class KoreaderCatalogService {
         offset,
         hasNext,
         hasPrevious,
-        nextUrl: hasNext ? this.booksHref({ ...query, page: undefined, offset: offset + size, size }) : null,
-        previousUrl: hasPrevious ? this.booksHref({ ...query, page: undefined, offset: Math.max(0, offset - size), size }) : null,
+        nextUrl: hasNext && linkable ? this.booksHref({ ...query, page: undefined, offset: offset + size, size }) : null,
+        previousUrl: hasPrevious && linkable ? this.booksHref({ ...query, page: undefined, offset: Math.max(0, offset - size), size }) : null,
         seriesSummary,
       };
     }
@@ -1609,8 +1616,8 @@ export class KoreaderCatalogService {
       size,
       hasNext,
       hasPrevious,
-      nextUrl: hasNext ? this.pageHref(query, page + 1, size) : null,
-      previousUrl: hasPrevious ? this.pageHref(query, page - 1, size) : null,
+      nextUrl: hasNext && linkable ? this.pageHref(query, page + 1, size) : null,
+      previousUrl: hasPrevious && linkable ? this.pageHref(query, page - 1, size) : null,
       seriesSummary,
     };
   }

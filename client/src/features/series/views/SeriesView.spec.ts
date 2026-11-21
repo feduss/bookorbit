@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ref } from 'vue'
-import { flushPromises, mount } from '@vue/test-utils'
+import { flushPromises, mount, RouterLinkStub } from '@vue/test-utils'
 import { createI18n } from 'vue-i18n'
 import type { SeriesFacets, SeriesSummary } from '@bookorbit/types'
 import en from '@/locales/en.json'
@@ -38,6 +38,9 @@ function makeSeries(overrides: Partial<SeriesSummary> = {}): SeriesSummary {
     lastAddedAt: null,
     libraryNames: ['Novels'],
     expectedBookCount: null,
+    ownedVolumeCount: 2,
+    readVolumeCount: 1,
+    readingVolumeCount: 0,
     volumes: [
       { index: 1, bookId: 10, title: 'One', status: 'read' },
       { index: 2, bookId: null, title: null, status: 'missing' },
@@ -71,7 +74,8 @@ const mocks = vi.hoisted(() => ({
   completionStatus: null as unknown as { value: CompletionStatus | null },
 }))
 
-vi.mock('vue-router', () => ({
+vi.mock('vue-router', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('vue-router')>()),
   useRoute: () => mocks.route,
   useRouter: () => ({ push: mocks.routerPush, replace: mocks.routerReplace }),
 }))
@@ -124,9 +128,11 @@ async function mountView() {
         BrowseHeader: { template: '<div><slot name="bar" /></div>' },
         BrowseInlineGroup: { template: '<div><slot /></div>' },
         Popover: { template: '<div><slot /></div>' },
+        PopoverAnchor: { template: '<div><slot /></div>' },
         PopoverTrigger: { template: '<div><slot /></div>' },
         PopoverContent: { template: '<div><slot /></div>' },
         BookCoverArtwork: true,
+        RouterLink: RouterLinkStub,
       },
     },
   })

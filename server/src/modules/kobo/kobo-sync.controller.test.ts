@@ -1,10 +1,11 @@
 import { BadRequestException, HttpStatus } from '@nestjs/common';
 
 import { encodeSyncToken } from './services/kobo-sync-token';
-import { KoboSyncController } from './kobo-sync.controller';
+import { KoboDeviceDisconnectedError, KoboSyncController } from './kobo-sync.controller';
 
-function makeReply() {
+function makeReply({ deviceGone = false } = {}) {
   return {
+    raw: { destroyed: deviceGone },
     status: vi.fn().mockReturnThis(),
     header: vi.fn().mockReturnThis(),
     send: vi.fn().mockReturnThis(),
@@ -30,6 +31,7 @@ describe('KoboSyncController', () => {
   };
   const syncService = {
     getDelta: vi.fn(),
+    commitPage: vi.fn(),
     getBookMetadata: vi.fn(),
     removeBookFromSync: vi.fn(),
   };
@@ -63,6 +65,7 @@ describe('KoboSyncController', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    syncService.commitPage.mockResolvedValue(undefined);
     bookIdentityService.resolveBookIdByEntitlementId.mockImplementation((_userId: number, id: string) => (/^\d+$/.test(id) ? Number(id) : null));
     historyService.countsForBook.mockImplementation((_userId: number, bookId: number, counts: Record<string, unknown>) => ({
       ...counts,
@@ -242,11 +245,73 @@ describe('KoboSyncController', () => {
       expect(resources(controllerWithAppUrl('http://localhost:6263'), koboRequest('192.168.1.67')).image_host).toBe('http://192.168.1.67:3000');
     });
 
-    it('lets an explicit port or forwarded headers win over APP_URL', () => {
+    it('lets an explicit port, a forwarded port, or a forwarded scheme APP_URL does not share win over APP_URL', () => {
       const controller = controllerWithAppUrl('http://192.168.1.67:3010');
 
       expect(resources(controller, koboRequest('192.168.1.67:3000')).image_host).toBe('http://192.168.1.67:3000');
       expect(resources(controller, koboRequest('192.168.1.67', { 'x-forwarded-proto': 'https' })).image_host).toBe('https://192.168.1.67');
+      expect(resources(controller, koboRequest('192.168.1.67', { 'x-forwarded-host': '192.168.1.67', 'x-forwarded-port': '8080' })).image_host).toBe(
+        'http://192.168.1.67:8080',
+      );
+    });
+
+    describe("behind a forwarding proxy that repeats the Kobo's port-less Host (#2036)", () => {
+      const funnel = { 'x-forwarded-host': 'reader.tail1234.ts.net', 'x-forwarded-proto': 'https', 'x-forwarded-for': '203.0.113.9' };
+      const appUrl = 'https://reader.tail1234.ts.net:8443';
+
+      it('takes the public port from APP_URL, as Tailscale Funnel on a non-standard port needs', () => {
+        const res = resources(controllerWithAppUrl(appUrl), koboRequest('reader.tail1234.ts.net', funnel));
+
+        expect(res.image_host).toBe(appUrl);
+        expect(res.image_url_template).toBe(`${appUrl}/api/v1/kobo/abc/v1/books/{ImageId}/thumbnail/{Width}/{Height}/false/image.jpg`);
+        expect(res.library_sync).toBe(`${appUrl}/api/v1/kobo/abc/v1/library/sync`);
+        expect(res.reading_state).toBe(`${appUrl}/api/v1/kobo/abc/v1/library/{Ids}/state`);
+        expect(res.reading_services_host).toBe(appUrl);
+      });
+
+      it('matches the host without regard to case', () => {
+        expect(
+          resources(controllerWithAppUrl(appUrl), koboRequest('READER.tail1234.ts.net', { ...funnel, 'x-forwarded-host': 'READER.tail1234.ts.net' }))
+            .image_host,
+        ).toBe(appUrl);
+      });
+
+      it('uses APP_URL when the proxy forwards only the host', () => {
+        expect(
+          resources(controllerWithAppUrl(appUrl), koboRequest('reader.tail1234.ts.net', { 'x-forwarded-host': 'reader.tail1234.ts.net' })).image_host,
+        ).toBe(appUrl);
+      });
+
+      it('keeps the forwarded origin when APP_URL names another host or another scheme', () => {
+        expect(resources(controllerWithAppUrl('https://other.example.com:8443'), koboRequest('reader.tail1234.ts.net', funnel)).image_host).toBe(
+          'https://reader.tail1234.ts.net',
+        );
+        expect(resources(controllerWithAppUrl('http://reader.tail1234.ts.net:8443'), koboRequest('reader.tail1234.ts.net', funnel)).image_host).toBe(
+          'https://reader.tail1234.ts.net',
+        );
+      });
+
+      it('leaves a client that sends the port itself alone', () => {
+        const withPort = { ...funnel, 'x-forwarded-host': 'reader.tail1234.ts.net:9443' };
+
+        expect(resources(controllerWithAppUrl(appUrl), koboRequest('reader.tail1234.ts.net:9443', withPort)).image_host).toBe(
+          'https://reader.tail1234.ts.net:9443',
+        );
+      });
+
+      it('builds library sync download links from the same origin', async () => {
+        syncService.getDelta.mockResolvedValue({ entitlements: [], hasMore: false, syncToken: 'token' });
+        settingsService.getSettings.mockResolvedValue({ storeSync: false });
+
+        await controllerWithAppUrl(appUrl).librarySync(
+          { deviceId: 5, deviceToken: 'abc' } as never,
+          { id: 9 } as never,
+          koboRequest('reader.tail1234.ts.net', funnel) as never,
+          makeReply() as never,
+        );
+
+        expect(syncService.getDelta).toHaveBeenCalledWith(9, 5, 'abc', appUrl);
+      });
     });
 
     it('builds library sync download links from the same origin', async () => {
@@ -293,6 +358,82 @@ describe('KoboSyncController', () => {
     expect(reply.header).toHaveBeenCalledWith('x-kobo-sync', 'continue');
     expect(reply.header).toHaveBeenCalledWith('x-kobo-synctoken', 'SYNC-2');
     expect(reply.send).toHaveBeenCalledWith([{ NewEntitlement: { BookEntitlement: { Id: '12' } } }]);
+  });
+
+  describe('a page the device may not receive (#2250)', () => {
+    const commit = {
+      userId: 21,
+      deviceId: 9,
+      snapshotId: 4,
+      offeredBookIds: [12],
+      removedBookIds: [],
+      servedRemovalIds: [],
+      legacyRemovalCompletedBookIds: [],
+    };
+    const req = { headers: { host: 'kobo.local' }, protocol: 'http', hostname: 'kobo.local', socket: { localPort: 3000 } };
+
+    async function runSync(reply: ReturnType<typeof makeReply>) {
+      await controller.librarySync({ deviceId: 9, deviceToken: 'token-9' } as never, { id: 21 } as never, req as never, reply as never);
+    }
+
+    beforeEach(() => {
+      syncService.getDelta.mockResolvedValue({
+        entitlements: [{ NewEntitlement: { BookEntitlement: { Id: '12' } } }],
+        hasMore: true,
+        syncToken: 'SYNC-2',
+        commit,
+      });
+    });
+
+    it('records the page as delivered before sending it to a device that is still waiting', async () => {
+      const reply = makeReply();
+
+      await runSync(reply);
+
+      expect(syncService.commitPage).toHaveBeenCalledWith(commit);
+      expect(syncService.commitPage.mock.invocationCallOrder[0]).toBeLessThan(reply.send.mock.invocationCallOrder[0]!);
+      expect(historyService.recordSuccess).toHaveBeenCalledWith(expect.objectContaining({ event: 'library_sync' }));
+      expect(historyService.recordFailure).not.toHaveBeenCalled();
+    });
+
+    it('leaves the page pending and records a failure when the device has stopped waiting', async () => {
+      const reply = makeReply({ deviceGone: true });
+
+      await runSync(reply);
+
+      expect(syncService.commitPage).not.toHaveBeenCalled();
+      expect(historyService.recordSuccess).not.toHaveBeenCalled();
+      expect(historyService.recordFailure).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 21, deviceId: 9, event: 'library_sync', counts: { entitlements: 1, hasMore: true } }),
+        expect.any(KoboDeviceDisconnectedError),
+      );
+    });
+
+    it('notices a device that left while the store page was being fetched', async () => {
+      syncService.getDelta.mockResolvedValue({ entitlements: [], hasMore: false, syncToken: 'SYNC-2', commit });
+      settingsService.getSettings.mockResolvedValue({ storeSync: true });
+      const reply = makeReply();
+      proxyService.request.mockImplementationOnce(() => {
+        reply.raw.destroyed = true;
+        return Promise.resolve({ status: 200, headers: {}, body: Buffer.from('[]') });
+      });
+
+      await runSync(reply);
+
+      expect(syncService.commitPage).not.toHaveBeenCalled();
+      expect(historyService.recordFailure).toHaveBeenCalledWith(expect.anything(), expect.any(KoboDeviceDisconnectedError));
+    });
+
+    it('answers with an error, sending nothing, when the page cannot be recorded', async () => {
+      syncService.commitPage.mockRejectedValueOnce(new Error('disk full'));
+      const reply = makeReply();
+
+      await expect(runSync(reply)).rejects.toThrow('disk full');
+
+      expect(reply.send).not.toHaveBeenCalled();
+      expect(historyService.recordSuccess).not.toHaveBeenCalled();
+      expect(historyService.recordFailure).toHaveBeenCalledWith(expect.objectContaining({ event: 'library_sync' }), expect.any(Error));
+    });
   });
 
   describe('store sync', () => {
@@ -782,7 +923,7 @@ describe('KoboSyncController', () => {
       reply as never,
     );
 
-    expect(bookIdentityService.resolveBookIdByEntitlementId).toHaveBeenCalledWith(8, entitlementId);
+    expect(bookIdentityService.resolveBookIdByEntitlementId).toHaveBeenCalledWith(8, entitlementId, { followMerges: true });
     expect(readingStateService.upsertState).toHaveBeenCalledWith(8, 77, state, 1, 99, true, 77);
     expect(proxyService.forward).not.toHaveBeenCalled();
     expect(reply.send).toHaveBeenCalledWith(STATE_UPDATE_ACK);
@@ -828,7 +969,7 @@ describe('KoboSyncController', () => {
 
     await controller.getReadingState(ids, { id: 8 } as never, { deviceId: 77, deviceToken: 'dev77' } as never, req as never, reply as never);
 
-    expect(bookIdentityService.resolveBookIdByEntitlementId).toHaveBeenCalledWith(8, ids);
+    expect(bookIdentityService.resolveBookIdByEntitlementId).toHaveBeenCalledWith(8, ids, { followMerges: true });
     expect(proxyService.forward).toHaveBeenCalledWith(req, reply, 'dev77');
     expect(readingStateService.getRawState).not.toHaveBeenCalled();
   });

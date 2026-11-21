@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   KeyRound,
+  KeySquare,
   Library as LibraryIcon,
   ShieldCheck,
   SlidersHorizontal,
@@ -14,7 +15,7 @@ import {
   X,
   type LucideIcon,
 } from '@lucide/vue'
-import { Permission, type LibraryType } from '@bookorbit/types'
+import { Permission } from '@bookorbit/types'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet'
 import Badge from '@/components/ui/badge/Badge.vue'
@@ -23,12 +24,12 @@ import { formatDate, formatDateTime, formatList, formatNumber } from '@/i18n/for
 import StatusPill from './components/StatusPill.vue'
 import UserPermissionsSection from './components/UserPermissionsSection.vue'
 import UserRestrictionsSection from './components/UserRestrictionsSection.vue'
+import ApiKeyManager from '@/features/api-keys/components/ApiKeyManager.vue'
 import { useUserForm, type UserFormSection, type UserFormTarget } from './composables/useUserForm'
 
 interface LibraryOption {
   id: number
   name: string
-  type?: LibraryType
   bookCount?: number
 }
 
@@ -40,6 +41,8 @@ const props = defineProps<{
   currentUserId?: number
   canDelete?: boolean
   passwordLoginEnabled?: boolean
+  /** Whether the viewer may manage this person's API keys (`manage_users`). */
+  canManageApiKeys?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -60,6 +63,7 @@ const {
   selectedPermissionNames,
   selectedLibraryIds,
   editorLibraryIds,
+  savedLibraryIds,
   includeTagItems,
   excludeTagItems,
   includeGenreItems,
@@ -147,6 +151,25 @@ const profileSummary = computed(() => {
   return active.value ? t('adminFeature.userForm.active') : t('adminFeature.userForm.suspended')
 })
 
+/**
+ * Keys belong to an existing person who signs in. A manager who is not an administrator cannot
+ * touch an administrator's keys, so the section is not offered rather than failing on open.
+ */
+const showApiKeys = computed(
+  () =>
+    isEdit.value &&
+    props.user?.id !== undefined &&
+    props.user.provisioningMethod !== 'shared' &&
+    props.canManageApiKeys === true &&
+    (props.user.isSuperuser !== true || props.canManageSuperuser === true),
+)
+
+const apiKeyOwnerLibraries = computed(() => {
+  if (props.user?.isSuperuser) return props.libraries
+  const visible = new Set(savedLibraryIds.value)
+  return props.libraries.filter((library) => visible.has(library.id))
+})
+
 interface SectionEntry {
   id: UserFormSection
   label: string
@@ -172,6 +195,9 @@ const sections = computed<SectionEntry[]>(() => [
     icon: KeyRound,
   },
   { id: 'restrictions', label: t('adminFeature.userForm.sections.restrictions'), summary: restrictionSummary.value, icon: SlidersHorizontal },
+  ...(showApiKeys.value
+    ? [{ id: 'apiKeys' as const, label: t('apiKeys.admin.section'), summary: t('apiKeys.admin.sectionSummary'), icon: KeySquare }]
+    : []),
 ])
 
 const activeSectionLabel = computed(() => sections.value.find((section) => section.id === activeSection.value)?.label ?? '')
@@ -187,16 +213,16 @@ const libraryReach = computed(() => {
 })
 
 /**
- * Edit metadata only works on book libraries where the account is Editor or Owner, which is set on
+ * Edit metadata only works on libraries where the account is Editor or Owner, which is set on
  * each library rather than here. Say so wherever that leaves the permission short of the selection.
  */
 const permissionNotes = computed(() => {
   if (isSuperuserTarget.value || !selectedPermissionNames.value.has(Permission.LibraryEditMetadata)) return {}
-  const bookLibraries = props.libraries.filter((library) => library.type !== 'podcasts' && selectedLibraryIds.value.has(library.id))
-  const viewerOnly = bookLibraries.filter((library) => !editorLibraryIds.value.has(library.id))
-  if (bookLibraries.length > 0 && viewerOnly.length === 0) return {}
+  const selectedLibraries = props.libraries.filter((library) => selectedLibraryIds.value.has(library.id))
+  const viewerOnly = selectedLibraries.filter((library) => !editorLibraryIds.value.has(library.id))
+  if (selectedLibraries.length > 0 && viewerOnly.length === 0) return {}
   const note =
-    viewerOnly.length === bookLibraries.length
+    viewerOnly.length === selectedLibraries.length
       ? { text: t('adminFeature.userForm.permissionNotes.editMetadataNowhere'), warning: true }
       : {
           text: t('adminFeature.userForm.permissionNotes.editMetadataExcept', { libraries: formatList(viewerOnly.map((library) => library.name)) }),
@@ -582,6 +608,19 @@ async function handleSubmit() {
             @toggle="togglePermission"
             @update:content-filters-enabled="setContentFiltersEnabled"
           />
+
+          <section v-else-if="activeSection === 'apiKeys' && showApiKeys && user?.id" class="space-y-4">
+            <div>
+              <h3 class="settings-label">{{ t('apiKeys.admin.title') }}</h3>
+              <p class="settings-hint">{{ t('apiKeys.admin.hint') }}</p>
+            </div>
+            <ApiKeyManager
+              :owner-id="user.id"
+              :owner-is-superuser="user.isSuperuser === true"
+              :owner-permissions="user.permissions ?? []"
+              :libraries="apiKeyOwnerLibraries"
+            />
+          </section>
         </div>
       </div>
 

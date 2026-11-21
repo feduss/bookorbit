@@ -1,11 +1,12 @@
 import { randomUUID } from 'crypto';
 import { access, mkdir, readFile, stat, utimes, writeFile } from 'fs/promises';
-import { basename, join } from 'path';
+import { basename, dirname, join } from 'path';
 
 import { and, eq, sql } from 'drizzle-orm';
 import { Permission } from '@bookorbit/types';
 import type { AddedAtRecomputeJob, RegexMetadataConfig } from '@bookorbit/types';
 
+import { LibraryOperationGate } from '../src/common/services/library-operation-gate.service';
 import * as schema from '../src/db/schema';
 import { waitForCondition, waitForScanCompletion } from './e2e/app-harness';
 import {
@@ -701,6 +702,57 @@ describe('Library admin workflows (e2e)', { timeout: SCENARIO_TIMEOUT_MS }, () =
       expect(read.json().markAsFinishedPercentComplete).toBe(98.05);
     });
 
+    it('refuses folders that overlap another library folder, and keeps saving a library whose folders overlapped before', async () => {
+      const { body: books } = await createLibraryViaApi(ctx, manager.accessToken);
+      const booksFolder = books.folders[0]!.path;
+      const nested = join(booksFolder, 'comics');
+      const sibling = `${booksFolder}-extra`;
+      await mkdir(nested, { recursive: true });
+      await mkdir(sibling, { recursive: true });
+      const create = (folders: string[]) =>
+        ctx.app.inject({
+          method: 'POST',
+          url: '/api/v1/libraries',
+          headers: authHeader(manager.accessToken),
+          payload: { name: `Overlap ${randomUUID()}`, icon: 'library', folders },
+        });
+
+      for (const folders of [[nested], [booksFolder], [dirname(booksFolder)]]) {
+        const refused = await create(folders);
+        expect(refused.statusCode, refused.body).toBe(409);
+        expect(refused.json()).toMatchObject({
+          errorCode: 'LIBRARY_FOLDER_OVERLAP',
+          errorMeta: { path: folders[0], overlapPath: expect.any(String) },
+        });
+      }
+      const nestedInRequest = await create([sibling, join(sibling, 'inside')]);
+      expect(nestedInRequest.statusCode, nestedInRequest.body).toBe(409);
+
+      // A folder that only shares a name prefix is a different folder.
+      const accepted = await create([sibling]);
+      expect(accepted.statusCode, accepted.body).toBe(201);
+
+      await grantLibraryAccess(ctx, manager.userId, books.id, 'owner');
+      const addNested = await ctx.app.inject({
+        method: 'PATCH',
+        url: `/api/v1/libraries/${books.id}`,
+        headers: authHeader(manager.accessToken),
+        payload: { folders: [booksFolder, nested] },
+      });
+      expect(addNested.statusCode, addNested.body).toBe(409);
+      expect(await ctx.db.select().from(schema.libraryFolders).where(eq(schema.libraryFolders.libraryId, books.id))).toHaveLength(1);
+
+      // A library saved before the rule, with a second folder inside its first.
+      await ctx.db.insert(schema.libraryFolders).values({ libraryId: books.id, path: nested });
+      const resave = await ctx.app.inject({
+        method: 'PATCH',
+        url: `/api/v1/libraries/${books.id}`,
+        headers: authHeader(manager.accessToken),
+        payload: { name: `Renamed ${randomUUID()}`, folders: [booksFolder, nested] },
+      });
+      expect(resave.statusCode, resave.body).toBe(200);
+    });
+
     it('creates a library with the requested settings, requires explicit access rows, and reflects grant/update/revoke changes', async () => {
       const { body: createdLibrary } = await createLibraryViaApi(ctx, manager.accessToken, {
         name: `library-contract-${randomUUID()}`,
@@ -1001,14 +1053,14 @@ describe('Library admin workflows (e2e)', { timeout: SCENARIO_TIMEOUT_MS }, () =
       });
       expect(statsResponse.statusCode).toBe(200);
 
-      const primaryFiles = await ctx.db
+      const presentBookFiles = await ctx.db
         .select({
           sizeBytes: schema.bookFiles.sizeBytes,
         })
         .from(schema.books)
-        .innerJoin(schema.bookFiles, eq(schema.bookFiles.id, schema.books.primaryFileId))
+        .innerJoin(schema.bookFiles, eq(schema.bookFiles.bookId, schema.books.id))
         .where(and(eq(schema.books.libraryId, createdLibrary.id), eq(schema.books.status, 'present')));
-      const expectedTotalSize = primaryFiles.reduce((sum, row) => sum + Number(row.sizeBytes ?? 0), 0);
+      const expectedTotalSize = presentBookFiles.reduce((sum, row) => sum + Number(row.sizeBytes ?? 0), 0);
 
       expect(statsResponse.json()).toEqual({
         totalBooks: 2,
@@ -1031,6 +1083,59 @@ describe('Library admin workflows (e2e)', { timeout: SCENARIO_TIMEOUT_MS }, () =
         headers: authHeader(scopedUser.accessToken),
       });
       expectError(revokedStatsResponse, 403, 'No library access');
+    });
+
+    it('sizes a library by every file its books hold while formats count each book once', async () => {
+      const library = await createLibraryWithFolder(ctx, { mode: 'book_per_folder', name: `multi-file-stats-${randomUUID()}` });
+      await grantLibraryAccess(ctx, manager.userId, library.libraryId, 'owner');
+
+      const trackFolder = join(library.folderPath, 'Sam Whitfield - Harbour Lights');
+      await mkdir(trackFolder, { recursive: true });
+      const filePaths: string[] = [];
+      for (const track of ['01', '02', '03']) {
+        const trackPath = join(trackFolder, `${track}.mp3`);
+        await writeFile(trackPath, Buffer.concat([Buffer.from(`ID3 track ${track} ${randomUUID()}`), Buffer.alloc(Number(track) * 4096)]));
+        filePaths.push(trackPath);
+      }
+      filePaths.push(await createEpubFixture(library.folderPath, 'Sam Whitfield - The Long Tide/The Long Tide.epub', { title: 'The Long Tide' }));
+      // Older than the scanner's stability window, so the scan does not wait for the files to settle.
+      const settled = new Date(Date.now() - 5 * 60_000);
+      for (const filePath of filePaths) await utimes(filePath, settled, settled);
+
+      await startLibraryScanAs(ctx, manager.accessToken, library.libraryId);
+      await waitForNoRunningScans(ctx, library.libraryId);
+      await waitForCondition(async () => {
+        const [row] = await ctx.db
+          .select({ books: sql<number>`count(distinct ${schema.books.id})::int`, files: sql<number>`count(${schema.bookFiles.id})::int` })
+          .from(schema.books)
+          .innerJoin(schema.bookFiles, eq(schema.bookFiles.bookId, schema.books.id))
+          .where(and(eq(schema.books.libraryId, library.libraryId), eq(schema.books.status, 'present')));
+        expect(row).toEqual({ books: 2, files: 4 });
+      }, 10_000);
+
+      const sizesOnDisk = await Promise.all(filePaths.map(async (filePath) => (await stat(filePath)).size));
+      const expected = {
+        totalBooks: 2,
+        totalSizeBytes: sizesOnDisk.reduce((sum, size) => sum + size, 0),
+        formatCounts: { mp3: 1, epub: 1 },
+      };
+
+      const statsResponse = await ctx.app.inject({
+        method: 'GET',
+        url: `/api/v1/libraries/${library.libraryId}/stats`,
+        headers: authHeader(manager.accessToken),
+      });
+      expect(statsResponse.statusCode).toBe(200);
+      expect(statsResponse.json()).toEqual(expected);
+
+      const overviewResponse = await ctx.app.inject({
+        method: 'GET',
+        url: '/api/v1/libraries/overview',
+        headers: authHeader(manager.accessToken),
+      });
+      expect(overviewResponse.statusCode).toBe(200);
+      const entry = (overviewResponse.json() as Array<{ libraryId: number }>).find((row) => row.libraryId === library.libraryId);
+      expect(entry).toMatchObject(expected);
     });
   });
 
@@ -1160,6 +1265,34 @@ describe('Library admin workflows (e2e)', { timeout: SCENARIO_TIMEOUT_MS }, () =
       await expect(access(join(ctx.fixture.booksPath, 'covers', String(uploadedBookId)))).rejects.toMatchObject({
         code: 'ENOENT',
       });
+    });
+
+    it('refuses to delete a library while a scan, move, rename or merge holds it, and deletes it once that finishes', async () => {
+      const busyLibrary = await createLibraryWithFolder(ctx, { name: `library-busy-${randomUUID()}` });
+      const releaseMove = ctx.app.get(LibraryOperationGate).tryAcquire(busyLibrary.libraryId, 'book_move');
+      expect(releaseMove).not.toBeNull();
+
+      const refused = await ctx.app.inject({
+        method: 'DELETE',
+        url: `/api/v1/libraries/${busyLibrary.libraryId}`,
+        headers: authHeader(ctx.adminToken),
+      });
+      expect(refused.statusCode).toBe(409);
+      expect(refused.json()).toMatchObject({ errorCode: 'LIBRARY_BUSY' });
+      const stillThere = await ctx.db
+        .select({ id: schema.libraries.id })
+        .from(schema.libraries)
+        .where(eq(schema.libraries.id, busyLibrary.libraryId));
+      expect(stillThere).toHaveLength(1);
+
+      releaseMove!();
+      const deleted = await ctx.app.inject({
+        method: 'DELETE',
+        url: `/api/v1/libraries/${busyLibrary.libraryId}`,
+        headers: authHeader(ctx.adminToken),
+      });
+      expect(deleted.statusCode).toBe(204);
+      expect(ctx.app.get(LibraryOperationGate).isHeld(busyLibrary.libraryId)).toBe(false);
     });
   });
 });

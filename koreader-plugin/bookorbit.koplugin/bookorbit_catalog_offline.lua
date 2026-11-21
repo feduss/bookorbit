@@ -221,7 +221,7 @@ function CatalogOffline:offlineServeBooks(params, title, push)
         query.ids = table.concat(ids, ",")
         opts.extra = extra
         if not snapshot then snapshot = { books = {}, saved_at = 0 } end
-    elseif query.not_on_device then
+    elseif query.not_on_device_filter then
         opts.exclude = function(book) return self:isOnDevice(book) end
     end
     local body, from

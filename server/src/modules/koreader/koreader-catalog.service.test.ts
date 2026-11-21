@@ -15,7 +15,7 @@ import type { MockedFunction } from 'vitest';
 
 import { formatSeriesIndex } from '../../common/utils/series-index-format.utils';
 import { makeUser } from '../../common/test-utils/make-user';
-import { KoreaderCatalogBooksQueryDto, KoreaderCatalogManifestQueryDto } from './dto/koreader-catalog-query.dto';
+import { KoreaderCatalogBooksQueryDto, KoreaderCatalogBooksSearchDto, KoreaderCatalogManifestQueryDto } from './dto/koreader-catalog-query.dto';
 import { KoreaderCatalogService } from './koreader-catalog.service';
 
 const mockCreateReadStream = createReadStream as MockedFunction<typeof createReadStream>;
@@ -864,6 +864,48 @@ describe('KoreaderCatalogService', () => {
     expect(res.nextUrl).toBe('/api/v1/koreader/plugin/catalog/books?page=3&size=12&sort=title');
   });
 
+  it('leaves out the excluded books and offers no GET links, which could not carry the exclusion', async () => {
+    const { service, opdsBookService } = makeService();
+    opdsBookService.getBooksPage.mockResolvedValue({ total: 50, entries: [] });
+    const user = makeUser({ id: 4 });
+
+    const paged = await service.getBooksPage(
+      user,
+      Object.assign(new KoreaderCatalogBooksSearchDto(), { page: 2, size: 12, sort: 'title', libraryId: 3, excludeIds: [8, 9] }),
+    );
+    const offset = await service.getBooksPage(
+      user,
+      Object.assign(new KoreaderCatalogBooksSearchDto(), { offset: 12, size: 12, sort: 'title', excludeIds: [8, 9] }),
+    );
+
+    expect(opdsBookService.getBooksPage).toHaveBeenNthCalledWith(
+      1,
+      4,
+      'title_asc',
+      2,
+      12,
+      { libraryId: 3, excludeIds: [8, 9] },
+      false,
+      user.contentFilters,
+    );
+    expect(paged).toEqual(expect.objectContaining({ hasNext: true, hasPrevious: true, nextUrl: null, previousUrl: null }));
+    expect(offset).toEqual(expect.objectContaining({ offset: 12, hasNext: true, hasPrevious: true, nextUrl: null, previousUrl: null }));
+  });
+
+  it('treats an empty exclusion as no filter at all', async () => {
+    const { service, opdsBookService } = makeService();
+    opdsBookService.getBooksPage.mockResolvedValueOnce({ total: 50, entries: [] });
+    const user = makeUser({ id: 4 });
+
+    const res = await service.getBooksPage(
+      user,
+      Object.assign(new KoreaderCatalogBooksSearchDto(), { page: 2, size: 12, sort: 'title', excludeIds: [] }),
+    );
+
+    expect(opdsBookService.getBooksPage).toHaveBeenCalledWith(4, 'title_asc', 2, 12, {}, false, user.contentFilters);
+    expect(res.nextUrl).toBe('/api/v1/koreader/plugin/catalog/books?page=3&size=12&sort=title');
+  });
+
   it('maps explicit sort order to ascending/descending variants', async () => {
     const { service, opdsBookService } = makeService();
     const user = makeUser({ id: 11 });
@@ -876,6 +918,12 @@ describe('KoreaderCatalogService', () => {
 
     await service.getBooksPage(user, Object.assign(new KoreaderCatalogBooksQueryDto(), { sort: 'recently_read', order: 'asc' }));
     expect(opdsBookService.getBooksPage).toHaveBeenLastCalledWith(11, 'last_read_asc', 1, 20, {}, false, user.contentFilters);
+
+    await service.getBooksPage(user, Object.assign(new KoreaderCatalogBooksQueryDto(), { sort: 'published' }));
+    expect(opdsBookService.getBooksPage).toHaveBeenLastCalledWith(11, 'published_asc', 1, 20, {}, false, user.contentFilters);
+
+    await service.getBooksPage(user, Object.assign(new KoreaderCatalogBooksQueryDto(), { sort: 'published', order: 'desc' }));
+    expect(opdsBookService.getBooksPage).toHaveBeenLastCalledWith(11, 'published_desc', 1, 20, {}, false, user.contentFilters);
   });
 
   it('reports when a book was last opened, the newest across its files', async () => {

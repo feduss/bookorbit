@@ -2,17 +2,22 @@ import { readdir } from 'fs/promises';
 import { join } from 'path';
 
 /**
- * Generic recursive directory traversal shared by the book scanner and the podcast importer.
+ * Generic recursive directory traversal behind the book scanner.
  *
- * Only the traversal itself lives here: what a directory's files *mean* differs per library type,
- * so each caller receives the entries through `visit` and does its own grouping. Behaviour that is
- * genuinely common stays here - dotfile and symlink skips, the path-length ceiling, tolerating an
- * unreadable directory instead of failing the whole walk, and bounding how many directories are
+ * Only the traversal itself lives here: callers receive the entries through `visit` and do their own
+ * grouping. The behaviour lives here - dotfile and symlink skips, the path-length ceiling, tolerating
+ * an unreadable directory instead of failing the whole walk, and bounding how many directories are
  * read at once so a deep tree cannot exhaust the file descriptor table.
  */
 
 export const WALK_MAX_PATH_LENGTH = 4096;
 export const WALK_DIR_CONCURRENCY_LIMIT = 50;
+
+const PERMISSION_ERROR_CODES = new Set(['EACCES', 'EPERM']);
+// Network shares can list an entry in its parent that then fails to open (a stale SMB entry gives
+// ENOENT, a stale NFS handle ESTALE), so a subdirectory that vanished or cannot be read is skipped
+// rather than failing the whole walk.
+const UNREADABLE_SUBDIRECTORY_ERROR_CODES = new Set(['ENOENT', 'ENOTDIR', 'EIO', 'ELOOP', 'ESTALE']);
 
 export interface WalkedDirectory {
   /** Absolute path of the directory being visited. */
@@ -29,6 +34,8 @@ export interface WalkDirectoryTreeOptions {
   /** Called for every readable directory, parents before children. */
   visit: (directory: WalkedDirectory) => Promise<void> | void;
   shouldExclude?: (name: string) => boolean;
+  /** Absolute directory paths the walk neither visits nor descends into, the root included. */
+  skipDirectories?: ReadonlySet<string>;
   logger?: (message: string) => void;
   /** Entries the walk refused to hand to `visit`, for callers that have to account for them. */
   onSkippedEntry?: (entry: { path: string; reason: WalkSkippedEntryReason }) => void;
@@ -37,7 +44,7 @@ export interface WalkDirectoryTreeOptions {
 }
 
 export interface WalkDirectoryTreeResult {
-  /** Directories that could not be read because of permissions. */
+  /** Directories that could not be read: denied by permissions, or subdirectories that vanished or failed to open. */
   skippedDirs: Set<string>;
 }
 
@@ -62,11 +69,12 @@ export function buildNameExcludeMatcher(patterns: string[]): (name: string) => b
 
 export async function walkDirectoryTree(root: string, options: WalkDirectoryTreeOptions): Promise<WalkDirectoryTreeResult> {
   const skippedDirs = new Set<string>();
-  await collectDirectory(root, options, skippedDirs);
+  if (options.skipDirectories?.has(root)) return { skippedDirs };
+  await collectDirectory(root, options, skippedDirs, true);
   return { skippedDirs };
 }
 
-async function collectDirectory(dir: string, options: WalkDirectoryTreeOptions, skippedDirs: Set<string>): Promise<void> {
+async function collectDirectory(dir: string, options: WalkDirectoryTreeOptions, skippedDirs: Set<string>, isRoot = false): Promise<void> {
   const maxPathLength = options.maxPathLength ?? WALK_MAX_PATH_LENGTH;
   const concurrencyLimit = options.concurrencyLimit ?? WALK_DIR_CONCURRENCY_LIMIT;
   const shouldExclude = options.shouldExclude ?? (() => false);
@@ -76,8 +84,14 @@ async function collectDirectory(dir: string, options: WalkDirectoryTreeOptions, 
     entries = await readdir(dir, { withFileTypes: true });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EACCES' || code === 'EPERM') {
+    if (code && PERMISSION_ERROR_CODES.has(code)) {
       options.logger?.(`Permission denied reading folder, skipping: ${dir}`);
+      skippedDirs.add(dir);
+      return;
+    }
+    // A missing root means the library itself is gone or unmounted, which must not read as an empty library.
+    if (!isRoot && code && UNREADABLE_SUBDIRECTORY_ERROR_CODES.has(code)) {
+      options.logger?.(`Cannot read folder (${code}), skipping: ${dir}`);
       skippedDirs.add(dir);
       return;
     }
@@ -98,6 +112,7 @@ async function collectDirectory(dir: string, options: WalkDirectoryTreeOptions, 
       continue;
     }
     if (entry.isDirectory()) {
+      if (options.skipDirectories?.has(full)) continue;
       subdirectoryPaths.push(full);
     } else if (entry.isFile()) {
       if (full.length > maxPathLength) {

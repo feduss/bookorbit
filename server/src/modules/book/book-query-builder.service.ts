@@ -2,8 +2,16 @@ import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import { AnyColumn, SQL, and, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, not, or, sql } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
 
-import { READ_ALONG_FORMAT_PRIORITY, parseCustomRuleFieldId, parseCustomSortFieldId, parseSeriesIndex } from '@bookorbit/types';
+import {
+  PLAIN_EPUB_FILTER_FORMAT,
+  READ_ALONG_FORMAT_PRIORITY,
+  STORY_GUIDE_FEATURE,
+  parseCustomRuleFieldId,
+  parseCustomSortFieldId,
+  parseSeriesIndex,
+} from '@bookorbit/types';
 import type {
+  AuthorGender,
   CommunityRatingProvider,
   ContentFilterRules,
   CustomMetadataFieldTypeMap,
@@ -14,6 +22,7 @@ import type {
   SortSpec,
 } from '@bookorbit/types';
 import { DB } from '../../db';
+import { bookLastReadSql } from '../../db/book-last-read';
 import { isDateKey, resolveTimeZone, toDateKeyInTimeZone } from '../../common/utils/timezone.utils';
 import { buildContentFilterClauses } from '../../common/utils/content-filter-sql.utils';
 import { accentInsensitiveIlike, buildSearchPattern, escapeLikePattern } from '../../common/utils/accent-insensitive-search.utils';
@@ -23,10 +32,12 @@ import { activeCoverSlotSql, coverMediaSql } from '../book-cover-store/book-cove
 import { BookSortBuilder, customMetadataValueColumn, resolveRandomSortSeed, type BookSortContext } from './book-sort-builder.service';
 import {
   audiobookProgress,
+  aiArtifacts,
   authors,
   bookAuthors,
   bookCustomMetadataValues,
   bookFiles,
+  bookFileTexts,
   bookGenres,
   bookCommunityRatings,
   bookMetadata,
@@ -194,6 +205,8 @@ export class BookQueryBuilder {
         );
       case 'author':
         return this.authorRuleToSql(operator, value as string[]);
+      case 'authorGender':
+        return this.authorGenderRuleToSql(operator, value as AuthorGender[]);
       case 'genre':
         return this.genreRuleToSql(operator, value as string[]);
       case 'tag':
@@ -204,6 +217,8 @@ export class BookQueryBuilder {
         return this.libraryRuleToSql(operator, value as string[]);
       case 'format':
         return this.formatRuleToSql(operator, value as string[]);
+      case 'storyGuide':
+        return this.storyGuideRuleToSql(operator);
       case 'fileSize':
         return this.numericRuleToSql(
           sql<number>`(SELECT ${bookFiles.sizeBytes} FROM ${bookFiles} WHERE ${bookFiles.id} = ${books.primaryFileId})`,
@@ -619,6 +634,53 @@ export class BookQueryBuilder {
     }
   }
 
+  private authorGenderRuleToSql(operator: string, values?: AuthorGender[]): SQL {
+    const existsAuthorGender = (whereClause?: SQL) => {
+      const predicates: SQL[] = [eq(bookAuthors.bookId, books.id)];
+      if (whereClause) predicates.push(whereClause);
+      const sq = this.db
+        .select({ one: sql`1` })
+        .from(bookAuthors)
+        .innerJoin(authors, eq(bookAuthors.authorId, authors.id))
+        .where(and(...predicates)!);
+      return sql`exists (${sq})`;
+    };
+
+    switch (operator) {
+      case 'includesAny':
+        if (!values?.length) return sql`1 = 0`;
+        return existsAuthorGender(inArray(authors.gender, values));
+      case 'excludesAll':
+        if (!values?.length) return sql`1 = 1`;
+        return not(existsAuthorGender(inArray(authors.gender, values)));
+      case 'isEmpty':
+        return not(existsAuthorGender(isNotNull(authors.gender)));
+      case 'isNotEmpty':
+        return existsAuthorGender(isNotNull(authors.gender));
+      default:
+        throw new BadRequestException(`Invalid operator '${operator}' for authorGender field`);
+    }
+  }
+
+  private storyGuideRuleToSql(operator: string): SQL {
+    const sq = this.db
+      .select({ one: sql`1` })
+      .from(bookFiles)
+      .innerJoin(bookFileTexts, eq(bookFileTexts.fileId, bookFiles.id))
+      .innerJoin(aiArtifacts, and(eq(aiArtifacts.feature, STORY_GUIDE_FEATURE), eq(aiArtifacts.subjectKey, bookFileTexts.textKey))!)
+      .where(eq(bookFiles.bookId, books.id));
+    const hasStoryGuide = sql`exists (${sq})`;
+
+    switch (operator) {
+      case 'isPresent':
+        return hasStoryGuide;
+      case 'isMissing':
+        return not(hasStoryGuide);
+      default:
+        throw new BadRequestException(`Invalid operator '${operator}' for storyGuide field`);
+    }
+  }
+
   private genreRuleToSql(operator: string, values?: string[]): SQL {
     const existsGenre = (whereClause?: SQL) => {
       const predicates: SQL[] = [eq(bookGenres.bookId, books.id)];
@@ -663,11 +725,14 @@ export class BookQueryBuilder {
 
     const matchesFormats = (): SQL | undefined => {
       if (!values?.length) return undefined;
-      const physicalFormats = values.filter((value) => value !== READ_ALONG_FORMAT_PRIORITY);
+      const physicalFormats = values.filter((value) => value !== READ_ALONG_FORMAT_PRIORITY && value !== PLAIN_EPUB_FILTER_FORMAT);
       const clauses: SQL[] = [];
       if (physicalFormats.length > 0) clauses.push(inArray(bookFiles.format, physicalFormats));
       if (values.includes(READ_ALONG_FORMAT_PRIORITY)) {
         clauses.push(and(eq(bookFiles.format, 'epub'), eq(bookFiles.mediaOverlayAvailable, true))!);
+      }
+      if (values.includes(PLAIN_EPUB_FILTER_FORMAT)) {
+        clauses.push(and(eq(bookFiles.format, 'epub'), eq(bookFiles.mediaOverlayAvailable, false))!);
       }
       return or(...clauses);
     };
@@ -1078,8 +1143,7 @@ export class BookQueryBuilder {
         .from(collectionBooks)
         .innerJoin(
           collections,
-          // Book collections only: a podcast collection sharing a name must never widen a book filter.
-          and(eq(collectionBooks.collectionId, collections.id), eq(collections.userId, userId), eq(collections.mediaType, 'books')),
+          and(eq(collectionBooks.collectionId, collections.id), or(eq(collections.userId, userId), eq(collections.isPublic, true))),
         )
         .where(and(...predicates)!);
       return sql`exists (${sq})`;
@@ -1144,13 +1208,13 @@ export class BookQueryBuilder {
     return node.rules.some((r) => BookQueryBuilder.hasSeriesSelectionFilter(r));
   }
 
-  static buildCollapseOrderBy(sort: SortSpec[], userId: number, customFieldTypes?: CustomMetadataFieldTypeMap, context?: BookSortContext): string {
-    if (sort.length === 0) return 'sort_title ASC NULLS LAST, r.id ASC';
+  static buildCollapseOrderBy(sort: SortSpec[], userId: number, customFieldTypes?: CustomMetadataFieldTypeMap, context?: BookSortContext): SQL {
+    if (sort.length === 0) return sql`sort_title ASC NULLS LAST, r.id ASC`;
 
     if (!Number.isSafeInteger(userId)) throw new BadRequestException('Invalid userId for collapse order');
     const safeUserId = String(Math.trunc(userId));
 
-    const parts: string[] = [];
+    const parts: (string | SQL)[] = [];
     for (const { field, dir } of sort) {
       const D = dir.toUpperCase();
       if (D !== 'ASC' && D !== 'DESC') continue;
@@ -1227,9 +1291,7 @@ export class BookQueryBuilder {
           );
           break;
         case 'lastReadAt':
-          parts.push(
-            `(SELECT max(rp.last_read_at) FROM reading_progress rp INNER JOIN book_files bf ON rp.book_file_id = bf.id WHERE bf.book_id = r.id AND rp.user_id = ${safeUserId}) ${D} NULLS LAST`,
-          );
+          parts.push(sql`${bookLastReadSql(sql`r.id`, userId)} ${sql.raw(D)} NULLS LAST`);
           break;
         case 'finishedAt':
           parts.push(`(SELECT ubs.finished_at FROM user_book_status ubs WHERE ubs.book_id = r.id AND ubs.user_id = ${safeUserId}) ${D} NULLS LAST`);
@@ -1255,6 +1317,9 @@ export class BookQueryBuilder {
     }
     if (parts.length === 0) parts.push('sort_title ASC NULLS LAST');
     parts.push('r.id ASC');
-    return parts.join(', ');
+    return sql.join(
+      parts.map((part) => (typeof part === 'string' ? sql.raw(part) : part)),
+      sql`, `,
+    );
   }
 }

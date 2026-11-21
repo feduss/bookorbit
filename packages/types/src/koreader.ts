@@ -3,6 +3,9 @@ import type { HighlightOfTheDayWidgetData, ReadingGoalWidgetData, ReadingStreakW
 import type { SeriesIndex } from "./series-index";
 import type { AchievementRarity } from "./achievement";
 
+/** Longest name a user can give a KOReader device. */
+export const KOREADER_DEVICE_NAME_MAX_LENGTH = 100;
+
 export interface KoreaderCredentials {
   readAloudDelivery?: ReadAloudDeliveryPreference;
   username: string;
@@ -15,6 +18,8 @@ export interface KoreaderCredentials {
 export interface KoreaderDeviceInfo {
   readAloudDelivery?: ReadAloudDeliveryPreference;
   device: string;
+  /** The name the user gave this device in BookOrbit, or null to show its model. */
+  deviceName?: string | null;
   deviceId: string;
   lastSyncAt: string;
   lastBookTitle: string | null;
@@ -27,6 +32,8 @@ export interface KoreaderDeviceInfo {
 
 export interface KoreaderBookProgress {
   device: string;
+  /** The name the user gave this device in BookOrbit, or null to show its model. */
+  deviceName?: string | null;
   deviceId: string;
   percentage: number;
   chapterIndex: number | null;
@@ -38,6 +45,8 @@ export interface KoreaderDeviceSweepInfo {
   readAloudDelivery?: ReadAloudDeliveryPreference;
   deviceId: string;
   deviceModel: string;
+  /** The name the user gave this device in BookOrbit, or null to show its model. */
+  deviceName?: string | null;
   pluginVersion: string | null;
   latestPluginVersion: string | null;
   updateAvailable: boolean | null;
@@ -97,6 +106,8 @@ export interface KoreaderBookSyncInfo {
 
 export interface KoreaderResetHeldDevice {
   device: string;
+  /** The name the user gave this device in BookOrbit, or null to show its model. */
+  deviceName?: string | null;
   deviceId: string;
   percentage: number;
   updatedAt: string;
@@ -198,7 +209,7 @@ export interface TestKoreaderConnectionResult {
 export type KoreaderCatalogSection =
   "libraries" | "collections" | "smart-scopes" | "authors" | "series" | "search" | "recent" | "all-books" | "continue-reading";
 
-export type KoreaderCatalogSort = "title" | "author" | "recently_added" | "recently_updated" | "recently_read" | "series";
+export type KoreaderCatalogSort = "title" | "author" | "published" | "recently_added" | "recently_updated" | "recently_read" | "series";
 
 export type KoreaderCatalogSortOrder = "asc" | "desc";
 
@@ -396,6 +407,7 @@ export interface KoreaderCatalogPage<T> {
   offset?: number;
   hasNext: boolean;
   hasPrevious: boolean;
+  // Null for a page asked for in a request body (POST books/query): a URL cannot carry its exclusions.
   nextUrl: string | null;
   previousUrl: string | null;
   // Present when the page is scoped to a single series, summarising
@@ -591,8 +603,10 @@ export type KoreaderPluginCapability =
   | "readAloudDeliveryVariants"
   | "readAloudDeliverySettings"
   | "catalogListsV2"
+  | "catalogPublishedSort"
   | "sidecarState"
-  | "annotationPendingBooks";
+  | "annotationPendingBooks"
+  | "catalogBooksQuery";
 
 export interface KoreaderPluginVersionInfo {
   pluginVersion: string;

@@ -1,12 +1,6 @@
-import type { IndexerCategoryMap } from '@bookorbit/types';
 import type { RequestIndexerManagerRow, RequestIndexerRow } from '../../../db/schema';
 import { IndexerManagerRepository } from './indexer-manager.repository';
 import type { ProwlarrIndexer } from './prowlarr.client';
-
-const categories: Record<'torrent' | 'usenet', IndexerCategoryMap> = {
-  torrent: { ebook: [7020], audiobook: [3030] },
-  usenet: { ebook: [7020], audiobook: [3030] },
-};
 
 function source(id: number, color: RequestIndexerRow['color']): RequestIndexerRow {
   return {
@@ -27,6 +21,7 @@ function discovered(id: number): ProwlarrIndexer {
     priority: 25,
     seedRatioGoal: null,
     seedTimeMinutes: null,
+    categories: { ebook: [7000], audiobook: [3030] },
   };
 }
 
@@ -67,7 +62,6 @@ describe('IndexerManagerRepository', () => {
         networkProfile: null,
       } as RequestIndexerManagerRow,
       [discovered(1), discovered(2), discovered(3)],
-      categories,
     );
 
     expect(updates.filter((update) => 'color' in update).map((update) => update.color)).toEqual(['orange', 'blue']);
@@ -75,7 +69,7 @@ describe('IndexerManagerRepository', () => {
   });
   it.each([
     { protocol: 'torrent' as const, inheritSeedLimits: false, expectedTracker: false, expectedRatio: null, expectedTime: null },
-    { protocol: 'torrent' as const, inheritSeedLimits: true, expectedTracker: true, expectedRatio: 1, expectedTime: 4320 },
+    { protocol: 'torrent' as const, inheritSeedLimits: true, expectedTracker: false, expectedRatio: 1, expectedTime: 4320 },
     { protocol: 'usenet' as const, inheritSeedLimits: false, expectedTracker: true, expectedRatio: null, expectedTime: null },
     { protocol: 'usenet' as const, inheritSeedLimits: true, expectedTracker: true, expectedRatio: null, expectedTime: null },
   ])(
@@ -115,7 +109,6 @@ describe('IndexerManagerRepository', () => {
             networkProfile: null,
           } as RequestIndexerManagerRow,
           [1, 2].map((id) => ({ ...discovered(id), protocol, seedRatioGoal: 1, seedTimeMinutes: 4320 })),
-          categories,
         ),
       ).resolves.toEqual({ created: 1, updated: 1, unavailable: 0 });
 
@@ -126,6 +119,7 @@ describe('IndexerManagerRepository', () => {
           applyTrackerSeedGoals: expectedTracker,
           seedRatioGoal: expectedRatio,
           seedTimeMinutes: expectedTime,
+          categories: { ebook: [7000], audiobook: [3030] },
         });
       }
     },

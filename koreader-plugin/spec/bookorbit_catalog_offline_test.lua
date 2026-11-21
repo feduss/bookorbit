@@ -288,7 +288,7 @@ assertEqual(shown.body.items[4].title, "Unknown Book", "else from the file name"
 assertEqual(shown.body.items[4].formats[1], "pdf", "with the file's format")
 assertEqual(shown.body.items[4].offline_stub, true, "marked as a stand-in")
 
-assertEqual(catalog:offlineServeBooks({ sort = "recently_added", not_on_device = true }, "Not on device", true), true, "Not on device is served offline")
+assertEqual(catalog:offlineServeBooks({ sort = "recently_added", not_on_device_filter = true }, "Library", true), true, "Not on this device is served offline")
 assertEqual(#shown.body.items, 4, "a screen of the books not here")
 for _, item in ipairs(shown.body.items) do
     assertEqual(catalog.on_device[item.id], nil, "none of them is on the device")

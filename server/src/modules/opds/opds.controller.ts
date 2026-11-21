@@ -21,6 +21,7 @@ import type { FastifyReply } from 'fastify';
 
 import { MAX_OFFSET_ROWS, isOffsetWithinLimit } from '../../common/constants/pagination.constants';
 import { Public } from '../../common/decorators/public.decorator';
+import { ResolvesMergedBook } from '../../common/decorators/resolves-merged-book.decorator';
 import { imageContentTypeFromPath } from '../../common/image-content-type';
 import { contentDispositionHeader } from '../../common/utils/content-disposition.utils';
 import { OPDS_MIME_ACQ, OPDS_MIME_NAV, OPDS_MIME_SEARCH, fileMimeType } from './opds-xml.helpers';
@@ -30,6 +31,8 @@ import { OpdsEnabledGuard } from './opds-enabled.guard';
 import { OpdsUser } from './opds-user.decorator';
 import { OpdsBookService } from './opds-book.service';
 import { OpdsService } from './opds.service';
+import { StaleDeliverySourceException } from '../book/delivery-artifact.service';
+import { ScannerService } from '../scanner/scanner.service';
 import { DeliverySelectionService } from '../book/delivery-selection.service';
 import { READ_ALOUD_DELIVERY_VARIANTS, type ReadAloudDeliveryVariant } from '@bookorbit/types';
 import { AudiolessEpubService } from '../book/audioless-epub.service';
@@ -46,6 +49,7 @@ export class OpdsController {
     private readonly opdsBookService: OpdsBookService,
     private readonly bookService: BookService,
     private readonly coverStore: BookCoverStore,
+    private readonly scanner: ScannerService,
     @Optional() private readonly audiolessEpubService?: AudiolessEpubService,
     @Optional() private readonly selections?: DeliverySelectionService,
   ) {}
@@ -224,6 +228,7 @@ export class OpdsController {
     reply.type(`${OPDS_MIME_SEARCH}; charset=utf-8`).send(xml);
   }
 
+  @ResolvesMergedBook({ params: ['bookId'] })
   @Get(':bookId/cover')
   async cover(
     @Param('bookId', ParseIntPipe) bookId: number,
@@ -251,6 +256,7 @@ export class OpdsController {
     }
   }
 
+  @ResolvesMergedBook({ params: ['bookId'] })
   @Get(':bookId/thumbnail')
   async thumbnail(
     @Param('bookId', ParseIntPipe) bookId: number,
@@ -293,6 +299,7 @@ export class OpdsController {
     reply.send(createReadStream(thumbnailPath));
   }
 
+  @ResolvesMergedBook({ params: ['bookId'] })
   @Get(':bookId/download')
   async download(
     @Param('bookId', ParseIntPipe) bookId: number,
@@ -312,15 +319,21 @@ export class OpdsController {
 
     const { absolutePath, format } = bookFiles;
     if (this.selections) {
-      const artifact = await this.selections.prepare(
-        user.userId,
-        `opds:${user.opdsUserId}`,
-        { ...bookFiles, id: bookFiles.id, absolutePath, format, mediaOverlayAvailable: bookFiles.readAlong },
-        variant ?? null,
-        selection,
-        bookFiles.contentVersion,
-        override !== undefined,
-      );
+      const artifact = await this.selections
+        .prepare(
+          user.userId,
+          `opds:${user.opdsUserId}`,
+          { ...bookFiles, id: bookFiles.id, absolutePath, format, mediaOverlayAvailable: bookFiles.readAlong },
+          variant ?? null,
+          selection,
+          bookFiles.contentVersion,
+          override !== undefined,
+        )
+        .catch((error: unknown) => {
+          if (error instanceof StaleDeliverySourceException)
+            this.scanner.rescanRegisteredFile(bookFiles.libraryId, bookId, bookFiles.id, absolutePath);
+          throw error;
+        });
       const filename = await this.bookService.resolveDownloadFilename({
         bookId,
         absolutePath,

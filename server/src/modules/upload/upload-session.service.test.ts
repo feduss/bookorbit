@@ -19,6 +19,8 @@ describe('UploadSessionService', () => {
   let storage: Record<string, any>;
   let upload: Record<string, any>;
   let library: Record<string, any>;
+  let bookDockIngest: Record<string, any>;
+  let libraryDocks: Record<string, any>;
   const validator = new UploadValidatorService();
   const user = { id: 7, isSuperuser: false, permissions: [Permission.LibraryUpload, Permission.BookDockAccess] } as any;
 
@@ -57,8 +59,7 @@ describe('UploadSessionService', () => {
       findCapabilityLibraries: vi.fn(() => [{ id: 1, name: 'Main', allowedFormats: ['epub', 'pdf'], organizationMode: 'book_per_folder' }]),
       findCapabilityFolders: vi.fn(() => [{ id: 2, libraryId: 1, path: '/books/Main Shelf' }]),
       findLibrary: vi.fn((id: number) => {
-        if (id === 1) return { id: 1, type: 'books', allowedFormats: ['epub', 'pdf'], organizationMode: 'book_per_folder' };
-        if (id === 3) return { id: 3, type: 'podcasts', allowedFormats: [], organizationMode: 'book_per_folder' };
+        if (id === 1) return { id: 1, allowedFormats: ['epub', 'pdf'], organizationMode: 'book_per_folder' };
         return null;
       }),
       folderBelongsToLibrary: vi.fn((folderId: number, libraryId: number) => folderId === 2 && libraryId === 1),
@@ -69,7 +70,6 @@ describe('UploadSessionService', () => {
           return {
             id: 9,
             libraryId: 1,
-            libraryType: 'books',
             allowedFormats: ['epub', 'pdf'],
             organizationMode: 'book_per_folder',
             folderPath: root,
@@ -79,7 +79,6 @@ describe('UploadSessionService', () => {
           return {
             id: 8,
             libraryId: 1,
-            libraryType: 'books',
             allowedFormats: ['epub', 'pdf'],
             organizationMode: 'book_per_folder',
             folderPath: join(root, 'a-book-that-is-a-file.cbz'),
@@ -102,7 +101,11 @@ describe('UploadSessionService', () => {
     };
     library = {
       findAccessibleLibraryIds: vi.fn(() => [1]),
-      verifyUserAccess: vi.fn(() => undefined),
+      verifyAccess: vi.fn(() => undefined),
+    };
+    bookDockIngest = { ingestUpload: vi.fn(() => 31) };
+    libraryDocks = {
+      resolveUploadDock: vi.fn((_user: unknown, libraryId: number) => ({ dockId: 5, libraryId, folderId: 2, folderName: 'Main' })),
     };
     service = new UploadSessionService(
       { appDataPath: root } as any,
@@ -113,7 +116,7 @@ describe('UploadSessionService', () => {
       storage as any,
       upload as any,
       { processNewBookImport: vi.fn(() => undefined) } as any,
-      { get: vi.fn() } as any,
+      { get: vi.fn((token: { name: string }) => (token.name === 'LibraryDockService' ? libraryDocks : bookDockIngest)) } as any,
     );
   });
 
@@ -204,13 +207,6 @@ describe('UploadSessionService', () => {
     await service.create(dto, user);
 
     await expect(service.create({ ...dto, sizeBytes: 11 }, user)).rejects.toBeInstanceOf(ConflictException);
-  });
-
-  it('refuses a library that does not hold books', async () => {
-    await expect(service.create({ ...createDto(), target: { kind: 'library', libraryId: 3 } } as any, user)).rejects.toMatchObject({
-      response: { errorCode: UploadErrorCode.InvalidTarget },
-    });
-    expect(repo.create).not.toHaveBeenCalled();
   });
 
   it('enforces upload permission and library-folder ownership before creating files', async () => {
@@ -338,6 +334,77 @@ describe('UploadSessionService', () => {
     expect(upload.addFileToBook).toHaveBeenCalledWith(9, 'book.pdf', expect.anything(), user);
     expect(result.status).toBe('completed');
     expect(result.bookId).toBe(9);
+  });
+
+  describe('Book Dock targets', () => {
+    async function received(target: Record<string, unknown>, idempotencyKey = 'upload-key-dock') {
+      const response = await service.create({ ...createDto(), sizeBytes: 9, idempotencyKey, target } as any, user);
+      await writeFile(rows.get(response.id).stagingPath, '%PDF-1234');
+      rows.set(response.id, { ...rows.get(response.id), receivedBytes: 9 });
+      return response;
+    }
+
+    it('lands an upload without a library in Unsorted, exactly as before', async () => {
+      const response = await received({ kind: 'book_dock' });
+
+      expect(response.target).toEqual({ kind: 'book_dock' });
+      expect(rows.get(response.id).targetLibraryId).toBeNull();
+      const result = await service.complete(response.id, user);
+
+      expect(bookDockIngest.ingestUpload).toHaveBeenCalledWith('book.pdf', expect.anything(), user.id, undefined);
+      expect(libraryDocks.resolveUploadDock).not.toHaveBeenCalled();
+      expect(result).toMatchObject({ status: 'completed', bookDockFileId: 31, target: { kind: 'book_dock' } });
+    });
+
+    it("checks a library's dock before any bytes arrive, again on completion, and lands the file there", async () => {
+      const response = await received({ kind: 'book_dock', libraryId: 1 });
+
+      expect(libraryDocks.resolveUploadDock).toHaveBeenCalledWith(user, 1, 'book.pdf');
+      expect(response.target).toEqual({ kind: 'book_dock', libraryId: 1 });
+      expect(rows.get(response.id).targetLibraryId).toBe(1);
+      const result = await service.complete(response.id, user);
+
+      expect(libraryDocks.resolveUploadDock).toHaveBeenCalledTimes(2);
+      expect(repo.findLibraryAllowedFormats).toHaveBeenCalledWith(1);
+      expect(bookDockIngest.ingestUpload).toHaveBeenCalledWith('book.pdf', expect.anything(), user.id, {
+        dockId: 5,
+        libraryId: 1,
+        folderId: 2,
+        folderName: 'Main',
+      });
+      expect(result).toMatchObject({ status: 'completed', bookDockFileId: 31, target: { kind: 'book_dock', libraryId: 1 } });
+    });
+
+    it('creates nothing when the dock refuses the upload', async () => {
+      libraryDocks.resolveUploadDock.mockImplementationOnce(() => {
+        throw uploadError.invalidTarget('This library has no Library Dock turned on');
+      });
+
+      await expect(service.create({ ...createDto(), target: { kind: 'book_dock', libraryId: 1 } } as any, user)).rejects.toMatchObject({
+        response: { errorCode: UploadErrorCode.InvalidTarget },
+      });
+      expect(rows.size).toBe(0);
+    });
+
+    it('fails the import with its code when the dock was turned off while the bytes arrived', async () => {
+      const response = await received({ kind: 'book_dock', libraryId: 1 });
+      libraryDocks.resolveUploadDock.mockImplementationOnce(() => {
+        throw uploadError.invalidTarget('This library has no Library Dock turned on');
+      });
+
+      await expect(service.complete(response.id, user)).rejects.toMatchObject({ response: { errorCode: UploadErrorCode.InvalidTarget } });
+      expect(bookDockIngest.ingestUpload).not.toHaveBeenCalled();
+      expect(rows.get(response.id)).toMatchObject({ status: 'failed', errorCode: UploadErrorCode.InvalidTarget });
+    });
+
+    it("reuses a key only for the same library's dock", async () => {
+      const first = await service.create({ ...createDto(), target: { kind: 'book_dock', libraryId: 1 } } as any, user);
+
+      await expect(service.create({ ...createDto(), target: { kind: 'book_dock', libraryId: 1 } } as any, user)).resolves.toMatchObject({
+        id: first.id,
+      });
+      await expect(service.create({ ...createDto(), target: { kind: 'book_dock' } } as any, user)).rejects.toBeInstanceOf(ConflictException);
+    });
   });
 
   it('hides sessions owned by another account and refuses cancellation during processing', async () => {

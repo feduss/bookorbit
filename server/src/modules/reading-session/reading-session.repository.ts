@@ -21,11 +21,17 @@ import {
 import { parseKoreaderSessionId } from '../../common/utils/koreader-session-id.utils';
 import { resolveTimeZone, toDateKeyInTimeZone } from '../../common/utils/timezone.utils';
 import { DB } from '../../db';
+import { bookLastReadSql } from '../../db/book-last-read';
 import * as schema from '../../db/schema';
 import { bookFiles, books, koreaderSessionTombstones, readingSessionSyncCursors, readingSessions, userReadingDailyStats } from '../../db/schema';
 
 type Db = NodePgDatabase<typeof schema>;
 type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
+
+export interface BookReadingSessionPage extends BookReadingSessionListResponse {
+  /** Stored session id of each listed KOReader session, by row id. Internal: never sent to clients. */
+  koreaderSessionIds: Map<number, string>;
+}
 
 const MIN_READING_SESSION_SECONDS = 10;
 
@@ -487,7 +493,7 @@ export class ReadingSessionRepository {
     dateTo?: string,
     format?: string,
     timeZone = 'UTC',
-  ): Promise<BookReadingSessionListResponse> {
+  ): Promise<BookReadingSessionPage> {
     const conditions = [eq(readingSessions.bookId, bookId), eq(readingSessions.userId, userId)];
     if (dateFrom) conditions.push(gte(readingSessions.startedAt, new Date(dateFrom)));
     if (dateTo) conditions.push(lte(readingSessions.startedAt, new Date(dateTo)));
@@ -526,6 +532,7 @@ export class ReadingSessionRepository {
           source: readingSessions.source,
           attemptId: readingSessions.attemptId,
           sessionType: readingSessions.sessionType,
+          sessionId: readingSessions.sessionId,
         })
         .from(readingSessions)
         .leftJoin(bookFiles, eq(bookFiles.id, readingSessions.bookFileId))
@@ -543,6 +550,7 @@ export class ReadingSessionRepository {
           avgDurationSeconds: sql<number>`coalesce(avg(${readingSessions.durationSeconds}), 0)::int`,
           firstSessionAt: min(readingSessions.startedAt),
           lastSessionAt: max(readingSessions.startedAt),
+          lastReadAt: bookLastReadSql(sql`${bookId}`, userId).mapWith(readingSessions.startedAt),
           paceProgressDelta: sql<number>`coalesce(sum(${readingSessions.progressDelta}) filter (where ${readingSessions.progressDelta} > 0), 0)::real`,
           paceDurationSeconds: sql<number>`coalesce(sum(${readingSessions.durationSeconds}) filter (where ${readingSessions.progressDelta} > 0), 0)::int`,
         })
@@ -639,6 +647,7 @@ export class ReadingSessionRepository {
       avgDurationSeconds: statsRow?.avgDurationSeconds ?? 0,
       firstSessionAt: statsRow?.firstSessionAt ? (statsRow.firstSessionAt as Date).toISOString() : null,
       lastSessionAt: statsRow?.lastSessionAt ? (statsRow.lastSessionAt as Date).toISOString() : null,
+      lastReadAt: statsRow?.lastReadAt?.toISOString() ?? null,
       dailySummary,
       paceProgressDelta: statsRow?.paceProgressDelta ?? 0,
       paceDurationSeconds: statsRow?.paceDurationSeconds ?? 0,
@@ -664,7 +673,9 @@ export class ReadingSessionRepository {
       sessionType: toReadingSessionType(r.sessionType),
     }));
 
-    return { items, total, page, pageSize, stats };
+    const koreaderSessionIds = new Map(rows.filter((r) => r.source === 'koreader').map((r) => [r.id, r.sessionId]));
+
+    return { items, total, page, pageSize, stats, koreaderSessionIds };
   }
 
   async deleteSessionByBook(userId: number, bookId: number, sessionId: number, timeZone = 'UTC'): Promise<{ found: boolean }> {

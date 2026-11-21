@@ -34,6 +34,8 @@ local cloneParams = CatalogUtil.cloneParams
 local CatalogLists = {}
 
 CatalogLists.CAPABILITY = "catalogListsV2"
+CatalogLists.PUBLISHED_SORT_CAPABILITY = "catalogPublishedSort"
+CatalogLists.BOOKS_QUERY_CAPABILITY = "catalogBooksQuery"
 local DUMP_DIR = os.getenv("BO_LIST_DUMP")
 
 local SECTION_PAGED = { authors = true, series = true }
@@ -67,6 +69,25 @@ end
 function CatalogLists:listsSupported()
     local known = Capabilities.cached(self.client)
     return known ~= nil and known[CatalogLists.CAPABILITY] == true
+end
+
+-- "Not on this device" needs the server to leave out a set of books as long
+-- as the device's whole collection, which only the body query can carry.
+function CatalogLists:listNotOnDeviceSupported()
+    local known = Capabilities.cached(self.client)
+    return known ~= nil and known[CatalogLists.BOOKS_QUERY_CAPABILITY] == true
+end
+
+-- Every book on this device, as the exclusion the server takes: sorted, so the
+-- same set is the same request (and the same saved page). Nil when there are none.
+function CatalogLists:listOnDeviceExclusion()
+    local ids = {}
+    for id in pairs(self.on_device or {}) do
+        if self:isOnDevice({ id = id }) then table.insert(ids, id) end
+    end
+    if #ids == 0 then return nil end
+    table.sort(ids)
+    return table.concat(ids, ",")
 end
 
 -- Learns what the server supports, once per session, inside a connected job
@@ -240,6 +261,12 @@ end
 -- --------------------------------------------------------------- loading
 -- Book lists: extra request fields for newer servers.
 function CatalogLists:listDecorateBookQuery(query)
+    -- Read now rather than when the filter was chosen, so a book downloaded
+    -- from the list leaves it on the next load.
+    if query.not_on_device_filter then
+        self:refreshOnDevice()
+        query.excludeIds = self:listOnDeviceExclusion()
+    end
     if not self:listsSupported() then return query end
     local kind = self:listKind({ kind = "books", params = query })
     if kind == "books" and ((query.sort or "title") == "title" or query.sort == "author") then query.buckets = 1 end
@@ -438,10 +465,10 @@ function CatalogLists:listPaging(context)
         end
         return windowPaging(self:listStart(context), context.page_size, context.total, context.has_next)
     end
-    if kind == "seriespage" or kind == "authorpage" then
+    if kind == "seriespage" or kind == "authorpage" or kind == "shelves" then
         return { page = context.local_page or 1, pages = context.local_pages or 1 }
     end
-    if kind == "search" or kind == "shelves" then return { page = 1, pages = 1 } end
+    if kind == "search" then return { page = 1, pages = 1 } end
     if (kind == "books" or kind == "reading") and context.page_size and context.total then
         return windowPaging(self:listStart(context), context.page_size, context.total)
     end
@@ -461,7 +488,7 @@ function CatalogLists:listGoPage(page)
     local p = self:listPaging(context)
     if page < 1 or (p.pages and page > p.pages) then return true end
     if page == p.page then return true end
-    if kind == "seriespage" or kind == "authorpage" then
+    if kind == "seriespage" or kind == "authorpage" or kind == "shelves" then
         context.local_page = page
         self:updateItems(nil, true)
         return true
@@ -546,7 +573,31 @@ end
 
 -- ----------------------------------------------------------------- sheets
 local SORT_IDS = { "title", "author", "series", "recently_added", "recently_read" }
+local SERIES_SORTS = {
+    { id = "series", label = _("Series order") },
+    { id = "published", label = _("Publication date"), capability = CatalogLists.PUBLISHED_SORT_CAPABILITY },
+    { id = "title", label = _("Title") },
+    { id = "recently_read", label = _("Last read") },
+    { id = "recently_added", label = _("Added to library") },
+}
 local SHOW_IDS = { false, "unread", "reading", "finished" }
+
+local function seriesSorts(self)
+    local known = Capabilities.cached(self.client) or {}
+    local sorts = {}
+    for _i, sort in ipairs(SERIES_SORTS) do
+        if not sort.capability or known[sort.capability] == true then table.insert(sorts, sort) end
+    end
+    return sorts
+end
+
+local function seriesOrder(sort)
+    if sort == "series" then return { _("First to last"), _("Last to first") }, "asc" end
+    if sort == "published" then return { _("Oldest"), _("Newest") }, "asc" end
+    if sort == "title" then return { _("A–Z"), _("Z–A") }, "asc" end
+    if sort == "recently_read" then return { _("Recent first"), _("Oldest first") }, "desc" end
+    return { _("Newest"), _("Oldest") }, "desc"
+end
 
 function CatalogLists:listSheetState(context)
     context = context or self.current_context or {}
@@ -560,15 +611,20 @@ function CatalogLists:listOpenSheet(kind, focus)
     local list_kind = self:listKind(context)
     if kind == "sort" then
         local staged = {}
-        if list_kind == "books" or list_kind == "reading" then
+        if list_kind == "books" or list_kind == "reading" or list_kind == "seriespage" then
             local params = context.params or {}
+            local sort = params.sort or (list_kind == "seriespage" and "series" or "title")
+            if list_kind == "seriespage" and sort == "published" then
+                local known = Capabilities.cached(self.client) or {}
+                if known[CatalogLists.PUBLISHED_SORT_CAPABILITY] ~= true then sort = "series" end
+            end
             staged = {
-                sort = params.sort or "title",
-                order = self:effectiveOrder(params),
+                sort = sort,
+                order = params.order or CatalogUtil.NATURAL_ORDER[sort] or "asc",
                 readStatus = params.readStatus,
-                libraryId = params.libraryId,
-                format = params.format,
-                on_device = context.on_device_filter == true,
+                libraryId = list_kind ~= "seriespage" and params.libraryId or nil,
+                format = list_kind ~= "seriespage" and params.format or nil,
+                device = list_kind ~= "seriespage" and (context.on_device_filter and "on" or context.not_on_device_filter and "off") or nil,
             }
         else
             staged = { sort = context.sort or "name", filter = context.filter }
@@ -605,28 +661,46 @@ function CatalogLists:listApplySheet()
         params.readStatus = s.readStatus or nil
         params.libraryId = s.libraryId
         params.format = s.format
-        if s.on_device and not context.on_device_filter then
+        -- Until the device's books are known every book would read as missing,
+        -- listing books that are already here.
+        if s.device == "off" and not context.not_on_device_filter and not self:refreshOnDevice() then
+            require("bookorbit_toast").show(_("Still checking which books are on this device"), { icon = "hourglass", timeout = 3 })
+            return self:updateItems(nil, true)
+        end
+        if s.device == "on" and not context.on_device_filter then
             local ids = {}
             for id in pairs(self.on_device or {}) do table.insert(ids, id) end
             table.sort(ids)
             local capped = {}
             for i = 1, math.min(#ids, CatalogUtil.ON_DEVICE_MAX_IDS) do capped[i] = ids[i] end
             params.ids = table.concat(capped, ",")
-        elseif not s.on_device and context.on_device_filter then
+        elseif s.device ~= "on" and context.on_device_filter then
             params.ids = nil
         end
         if changed_sort then
             self.default_sort = s.sort
             self:persistSetting("catalog_sort", s.sort)
         end
-        params.on_device_filter = s.on_device == true or nil
+        params.on_device_filter = s.device == "on" or nil
+        params.not_on_device_filter = s.device == "off" or nil
+        params.excludeIds = nil
         params.page = 1
         params.size = nil
         local title = context.title
-        if context.on_device_filter and not s.on_device and title == _("On device") then
+        if context.on_device_filter and s.device ~= "on" and title == _("On device") then
             title = _("Library")
         end
         self:loadBooks(params, title, false)
+        return
+    end
+    if kind == "seriespage" then
+        local params = cloneParams(context.params or {})
+        params.sort = s.sort
+        params.order = s.order ~= (CatalogUtil.NATURAL_ORDER[s.sort] or "asc") and s.order or nil
+        params.readStatus = s.readStatus or nil
+        params.page = 1
+        params.size = nil
+        self:runConnected(function() self:fetchBookPage(params, context.title, false) end)
         return
     end
     if kind == "authors" or kind == "series" then
@@ -639,7 +713,9 @@ function CatalogLists:listResetSheet()
     if not sheet or sheet.kind ~= "sort" then return end
     local kind = self:listKind()
     if kind == "books" or kind == "reading" then
-        sheet.staged = { sort = "title", order = "asc", on_device = false }
+        sheet.staged = { sort = "title", order = "asc" }
+    elseif kind == "seriespage" then
+        sheet.staged = { sort = "series", order = "asc" }
     else
         sheet.staged = { sort = "name" }
     end
@@ -651,6 +727,25 @@ end
 function CatalogLists:listSortSheetModel(sheet)
     local s = sheet.staged
     local kind = self:listKind()
+    if kind == "seriespage" then
+        local sorts = seriesSorts(self)
+        local labels, sort_index = {}, 1
+        for i, sort in ipairs(sorts) do
+            labels[i] = sort.label
+            if sort.id == s.sort then sort_index = i end
+        end
+        local order_labels, first_order = seriesOrder(s.sort)
+        local show_index = 1
+        for i, id in ipairs(SHOW_IDS) do if (id or nil) == s.readStatus then show_index = i end end
+        return {
+            title = _("Sort and filter"),
+            sorts = { labels = labels, selected = sort_index },
+            order = { labels = order_labels, selected = (s.order or first_order) == first_order and 1 or 2 },
+            shows = { labels = { _("All"), _("Unread"), _("Reading"), _("Finished") }, selected = show_index },
+            rows = {},
+            note = _("Saved for this list"),
+        }
+    end
     if kind == "books" or kind == "reading" then
         local sort_index = 1
         for i, id in ipairs(SORT_IDS) do if id == s.sort then sort_index = i end end
@@ -666,6 +761,15 @@ function CatalogLists:listSortSheetModel(sheet)
             local options = { { label = _("All libraries"), value = false, on = s.libraryId == nil } }
             for _i, lib in ipairs(self:listLibraries()) do table.insert(options, { label = lib.title, value = tonumber(lib.id), on = tostring(lib.id) == tostring(s.libraryId) }) end
             return { pick = true, title = _("Library"), options = options }
+        elseif sheet.pick == "device" then
+            local options = {
+                { label = _("Any"), value = false, on = s.device == nil },
+                { label = _("On this device"), value = "on", on = s.device == "on" },
+            }
+            if s.device == "off" or self:listNotOnDeviceSupported() then
+                table.insert(options, { label = _("Not on this device"), value = "off", on = s.device == "off" })
+            end
+            return { pick = true, title = _("Device"), options = options }
         elseif sheet.pick == "format" then
             local options = { { label = _("Any"), value = false, on = s.format == nil } }
             for _i, fmt in ipairs(CatalogUtil.COMMON_FORMATS) do
@@ -679,7 +783,7 @@ function CatalogLists:listSortSheetModel(sheet)
             order = { labels = order_labels, selected = (s.order or natural) == first_order and 1 or 2 },
             shows = { labels = { _("All"), _("Unread"), _("Reading"), _("Finished") }, selected = show_index },
             rows = {
-                { icon = "bo-device", label = _("Only books on this device"), toggle = s.on_device == true, action = { kind = "sheet-device" }, key = "device" },
+                { icon = "bo-device", label = _("Device"), value = s.device == "on" and _("On this device") or s.device == "off" and _("Not on this device") or _("Any"), chevron = true, action = { kind = "sheet-open-pick", pick = "device" }, key = "device" },
                 { icon = "library", label = _("Library"), value = library_label, chevron = true, action = { kind = "sheet-open-pick", pick = "library" }, key = "library" },
                 { icon = "file-text", label = _("Format"), value = s.format and string.upper(s.format) or _("Any"), chevron = true, action = { kind = "sheet-open-pick", pick = "format" }, key = "format" },
                 { icon = "list-checks", label = _("Select books"), chevron = true, action = { kind = "select-start" }, key = "select" },
@@ -739,6 +843,10 @@ function CatalogLists:listRun(action, region, hold)
         if lk == "books" or lk == "reading" then
             sheet.staged.sort = SORT_IDS[action.index] or "title"
             sheet.staged.order = CatalogUtil.NATURAL_ORDER[sheet.staged.sort] or "asc"
+        elseif lk == "seriespage" then
+            local sort = seriesSorts(self)[action.index] or seriesSorts(self)[1]
+            sheet.staged.sort = sort and sort.id or "series"
+            sheet.staged.order = CatalogUtil.NATURAL_ORDER[sheet.staged.sort] or "asc"
         else
             sheet.staged.sort = action.index == 2 and "books" or "name"
         end
@@ -749,20 +857,20 @@ function CatalogLists:listRun(action, region, hold)
             local time_sort = CatalogUtil.SORT_KIND[sheet.staged.sort] == "time"
             local first = time_sort and "desc" or "asc"
             sheet.staged.order = action.index == 1 and first or (first == "asc" and "desc" or "asc")
+        elseif lk == "seriespage" then
+            local _labels, first = seriesOrder(sheet.staged.sort)
+            sheet.staged.order = action.index == 1 and first or (first == "asc" and "desc" or "asc")
         else
             sheet.staged.sort = action.index == 2 and "name_desc" or "name"
         end
         return self:updateItems(nil, true)
     elseif kind == "sheet-show" and sheet then
         local lk = self:listKind()
-        if lk == "books" or lk == "reading" then
+        if lk == "books" or lk == "reading" or lk == "seriespage" then
             sheet.staged.readStatus = SHOW_IDS[action.index] or nil
         else
             sheet.staged.filter = action.index == 2 and "reading" or action.index == 3 and "finished" or nil
         end
-        return self:updateItems(nil, true)
-    elseif kind == "sheet-device" and sheet then
-        sheet.staged.on_device = not sheet.staged.on_device
         return self:updateItems(nil, true)
     elseif kind == "sheet-open-pick" and sheet then
         sheet.pick = action.pick
@@ -775,6 +883,7 @@ function CatalogLists:listRun(action, region, hold)
         return self:updateItems(nil, true)
     elseif kind == "sheet-pick" and sheet then
         if sheet.pick == "library" then sheet.staged.libraryId = action.value or nil
+        elseif sheet.pick == "device" then sheet.staged.device = action.value or nil
         elseif sheet.pick == "format" then sheet.staged.format = action.value or nil end
         sheet.pick = nil
         return self:updateItems(nil, true)
@@ -865,7 +974,8 @@ function CatalogLists:listRun(action, region, hold)
         if context.kind == "books" then
             if context.on_device_filter and context.title == _("On device") then context.title = _("Library") end
             context.on_device_filter = nil
-            return self:listReload({ clear = { "readStatus", "format", "libraryId", "ids", "on_device_filter" } })
+            context.not_on_device_filter = nil
+            return self:listReload({ clear = { "readStatus", "format", "libraryId", "ids", "on_device_filter", "not_on_device_filter", "excludeIds" } })
         end
         return self:reloadSection(context.section, { page = 1, filter = false })
     elseif kind == "search-edit" then
@@ -1052,6 +1162,9 @@ function CatalogLists:listEmptyModel(kind, context)
     if query then
         return { icon = "search", title = T(_("Nothing matches “%1”"), query), body = _("Try fewer words, or search the whole library from the header."), action = nil }
     end
+    if context.not_on_device_filter and not (params.readStatus or params.format or params.libraryId) then
+        return { icon = "bo-device", title = _("Every book here is on this device"), body = _("Books you have not downloaded appear here."), action = { label = _("Clear filters"), action = { kind = "clear-filters" } } }
+    end
     if params.readStatus or params.format or params.libraryId or context.on_device_filter or context.filter then
         return { icon = "list-filter", title = _("Nothing matches these filters"), body = _("Clear a filter to see more."), action = { label = _("Clear filters"), action = { kind = "clear-filters" } } }
     end
@@ -1062,17 +1175,19 @@ end
 
 local SORT_SHORT = {
     title = _("Title A–Z"), author = _("Author A–Z"), series = _("Series order"), recently_added = _("Recently added"),
-    recently_updated = _("Recently updated"), recently_read = _("Last read"),
+    published = _("Publication date"), recently_updated = _("Recently updated"), recently_read = _("Last read"),
 }
 
 function CatalogLists:listSortLabel(params)
     local sort = params.sort or "title"
-    local order = self:effectiveOrder(params)
+    local order = params.order or CatalogUtil.NATURAL_ORDER[sort] or "asc"
     local label = SORT_SHORT[sort] or _("Title A–Z")
     if CatalogUtil.SORT_KIND[sort] == "alpha" and order == "desc" then
-        label = sort == "title" and _("Title Z–A") or sort == "author" and _("Author Z–A") or label
+        label = sort == "title" and _("Title Z–A") or sort == "author" and _("Author Z–A") or sort == "series" and _("Reverse series order") or label
     elseif CatalogUtil.SORT_KIND[sort] == "time" and order == "asc" then
-        label = label .. " " .. _("(oldest)")
+        label = sort == "published" and _("Publication date (oldest)") or label .. " " .. _("(oldest)")
+    elseif sort == "published" then
+        label = _("Publication date (newest)")
     end
     return label
 end
@@ -1083,7 +1198,8 @@ function CatalogLists:listToolbar(kind, context)
         local sort_label = self:listSortLabel(params)
         local show = params.readStatus
         local show_label = show == "unread" and _("Unread") or show == "reading" and _("Reading") or show == "finished" and _("Finished") or _("All books")
-        if context.on_device_filter then show_label = show and (show_label .. " · " .. _("On device")) or _("On device") end
+        local device_label = context.on_device_filter and _("On device") or context.not_on_device_filter and _("Not on device") or nil
+        if device_label then show_label = show and (show_label .. " · " .. device_label) or device_label end
         local lib_label = _("All libraries")
         if params.libraryId then
             for _i, lib in ipairs(self:listLibraries()) do if tostring(lib.id) == tostring(params.libraryId) then lib_label = lib.title end end
@@ -1091,8 +1207,17 @@ function CatalogLists:listToolbar(kind, context)
         end
         return {
             { icon = "arrow-up-down", label = sort_label, action = { kind = "sort-sheet", focus = "sort" }, key = "tb-sort" },
-            { icon = "list-filter", label = show_label, on = show ~= nil or context.on_device_filter == true, action = { kind = "sort-sheet", focus = "show" }, key = "tb-show" },
+            { icon = "list-filter", label = show_label, on = show ~= nil or device_label ~= nil, action = { kind = "sort-sheet", focus = "show" }, key = "tb-show" },
             { icon = "library", label = lib_label, on = params.libraryId ~= nil, action = { kind = "sort-sheet", focus = "library" }, key = "tb-library" },
+        }
+    end
+    if kind == "seriespage" then
+        if not self:listsSupported() then return {} end
+        local show = params.readStatus
+        local show_label = show == "unread" and _("Unread") or show == "reading" and _("Reading") or show == "finished" and _("Finished") or _("All books")
+        return {
+            { icon = "arrow-up-down", label = self:listSortLabel(params), action = { kind = "sort-sheet", focus = "sort" }, key = "tb-sort" },
+            { icon = "list-filter", label = show_label, on = show ~= nil, action = { kind = "sort-sheet", focus = "show" }, key = "tb-show" },
         }
     end
     if not self:listsSupported() then return {} end
@@ -1226,7 +1351,18 @@ function CatalogLists:listBody(kind, context)
             return list or {}
         end
         local m = { libraries = tag(shelves.libraries, "libraries"), collections = tag(shelves.collections, "collections"), scopes = tag(shelves["smart-scopes"], "smart-scopes") }
-        return function(f) return ListPages.shelvesBody(m, f) end, nil
+        local f = ListView.frame(sw, sh, { toolbar = false, offline = context.list_offline })
+        local layout = ListPages.shelvesLayout(m, f)
+        context.local_pages = #layout.pages
+        context.local_page = math.min(context.local_page or 1, #layout.pages)
+        m.local_page = context.local_page
+        context.visible_shelves = {}
+        for _ci, chunks in ipairs(layout.pages[context.local_page]) do
+            for _i, chunk in ipairs(chunks) do
+                for i = chunk.from, chunk.to do table.insert(context.visible_shelves, layout.groups[chunk.section][3][i]) end
+            end
+        end
+        return function(body_f) return ListPages.shelvesBody(m, body_f) end, m
     end
     if kind == "search" then
         local m = { results = context.results, query = context.query, scope = context.scope or "all", screen_w = sw, screen_h = sh,
@@ -1247,7 +1383,8 @@ function CatalogLists:listBody(kind, context)
         if not next_book then for i, b in ipairs(books) do if states[i] ~= "finished" then next_book, cur = b, i; break end end end
         local finished, reading = 0, 0
         for _i, s in ipairs(states) do if s == "finished" then finished = finished + 1 elseif s == "reading" then reading = reading + 1 end end
-        local layout = ListPages.seriesLayout(sw, sh, self:listView(kind), #books, context.list_offline == true)
+        local toolbar = context.list_offline ~= true
+        local layout = ListPages.seriesLayout(sw, sh, self:listView(kind), #books, context.list_offline == true, toolbar)
         context.local_pages = layout.pages
         context.local_page = math.min(context.local_page or 1, layout.pages)
         local lp = context.local_page
@@ -1255,8 +1392,10 @@ function CatalogLists:listBody(kind, context)
         local last = math.min(#books, lp == 1 and layout.first or (first + layout.rest - 1))
         local m = {
             entries = books, view = self:listView(kind), screen_w = sw, screen_h = sh, local_page = context.local_page,
-            offline = context.list_offline and {} or nil,
-            order_label = (context.params or {}).sort == "title" and _("Title A–Z") or _("Reading order"),
+            offline = context.list_offline and {} or nil, toolbar = toolbar,
+            select = self:isBulkSelectionActive(),
+            selected = function(b) return self.bulk_select_all or self:bulkIsBookSelected(b) end,
+            order_label = self:listSortLabel(context.params or {}),
             states = states, indexes = indexes, current_index = cur, next_book = next_book,
             range = #books > 0 and T(_("Books %1 – %2"), first, last) or nil,
             next_minutes = next_book and self:listMinutesLeft(next_book),
@@ -1334,7 +1473,8 @@ function CatalogLists:updateListPage(select_number, no_recalculate_dimen)
     local body, m = self:listBody(kind, context)
     -- Offline the band stands in for the toolbar: sorting, filtering and the
     -- view all need the server, unless the offline library serves the list.
-    local has_toolbar = (kind == "books" or kind == "reading" or kind == "authors" or kind == "series") and self:listOfflineLayout(context).toolbar ~= false
+    local has_toolbar = (kind == "books" or kind == "reading" or kind == "authors" or kind == "series" or kind == "seriespage")
+        and self:listOfflineLayout(context).toolbar ~= false
     local toolbar = nil
     if has_toolbar then
         local buttons = self:listToolbar(kind, context)
@@ -1391,8 +1531,7 @@ function CatalogLists:listThumbnailBooks(kind, context)
     for _i, b in ipairs(context.books or {}) do addBook(b) end
     local entries = context.entries or {}
     if kind == "shelves" then
-        entries = {}
-        for _s, list in pairs(context.shelves or {}) do for _i, e in ipairs(list) do table.insert(entries, e) end end
+        entries = context.visible_shelves or {}
     elseif kind == "search" then
         entries = {}
         for _i, e in ipairs(context.results.authors or {}) do table.insert(entries, e) end

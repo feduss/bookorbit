@@ -27,10 +27,22 @@ import {
   books,
   libraries,
 } from '../../db/schema';
+import { microseconds } from '../jobs/job-keyset';
 
 type Db = NodePgDatabase<typeof schema>;
 
 type BookMetadataFetchStatusSummary = Pick<BookMetadataFetchStatus, 'queued' | 'processing' | 'failed' | 'latestFailureAt'>;
+
+/** What the Jobs area's two summary rows read. Times are epoch microseconds, exact for a sort key. */
+export interface BookMetadataFetchJobCounts {
+  queued: number;
+  processing: number;
+  failed: number;
+  /** When the oldest queued or processing entry was queued; null when none waits. */
+  queueSince: number | null;
+  /** When the newest failure happened; null when none failed. */
+  failedAt: number | null;
+}
 
 export interface PreviewBookRow {
   bookId: number;
@@ -202,6 +214,38 @@ export class BookMetadataFetchQueueRepository {
     return summary;
   }
 
+  /**
+   * Counts only, for the Jobs area: the grouped count and oldest entry come from the
+   * `(status, created_at, book_id)` index alone, and the latest failure reads failed entries only.
+   */
+  async countForJobs(): Promise<BookMetadataFetchJobCounts> {
+    const [groups, failures] = await Promise.all([
+      this.db
+        .select({ status: bookMetadataFetchQueue.status, cnt: count(), since: microseconds(sql`min(${bookMetadataFetchQueue.createdAt})`) })
+        .from(bookMetadataFetchQueue)
+        .groupBy(bookMetadataFetchQueue.status),
+      this.db
+        .select({ latest: microseconds(sql`max(${bookMetadataFetchQueue.updatedAt})`) })
+        .from(bookMetadataFetchQueue)
+        .where(eq(bookMetadataFetchQueue.status, QUEUE_STATUS.FAILED)),
+    ]);
+
+    const counts: BookMetadataFetchJobCounts = { queued: 0, processing: 0, failed: 0, queueSince: null, failedAt: null };
+    for (const group of groups) {
+      const value = Number(group.cnt);
+      if (group.status === QUEUE_STATUS.FAILED) {
+        counts.failed = value;
+        continue;
+      }
+      if (group.status === QUEUE_STATUS.QUEUED) counts.queued = value;
+      else if (group.status === QUEUE_STATUS.PROCESSING) counts.processing = value;
+      else continue;
+      if (group.since !== null && (counts.queueSince === null || group.since < counts.queueSince)) counts.queueSince = group.since;
+    }
+    if (counts.failed > 0) counts.failedAt = failures[0]?.latest ?? null;
+    return counts;
+  }
+
   async resetAllProcessingOnBoot(): Promise<number> {
     const updated = await this.db
       .update(bookMetadataFetchQueue)
@@ -338,7 +382,6 @@ export class BookMetadataFetchQueueRepository {
       })
       .from(bookMetadata)
       .innerJoin(books, eq(books.id, bookMetadata.bookId))
-      .innerJoin(libraries, eq(libraries.id, books.libraryId))
       .where(scope);
 
     // Inlined, not bound: Postgres matches the GROUP BY to the select list textually, and two sets of
@@ -351,7 +394,6 @@ export class BookMetadataFetchQueueRepository {
       .select({ bin, cnt: count() })
       .from(bookMetadata)
       .innerJoin(books, eq(books.id, bookMetadata.bookId))
-      .innerJoin(libraries, eq(libraries.id, books.libraryId))
       .where(and(scope, isNotNull(bookMetadata.metadataScore)))
       .groupBy(bin);
     const scoreBins = Array.from({ length: SCORE_BIN_COUNT }, () => 0);
@@ -405,16 +447,10 @@ export class BookMetadataFetchQueueRepository {
         })
         .from(bookMetadata)
         .innerJoin(books, eq(books.id, bookMetadata.bookId))
-        .innerJoin(libraries, eq(libraries.id, books.libraryId))
         .where(where)
         .orderBy(sql`${bookMetadata.metadataScore} ASC NULLS FIRST`, asc(bookMetadata.bookId))
         .limit(limit),
-      this.db
-        .select({ cnt: count() })
-        .from(bookMetadata)
-        .innerJoin(books, eq(books.id, bookMetadata.bookId))
-        .innerJoin(libraries, eq(libraries.id, books.libraryId))
-        .where(where),
+      this.db.select({ cnt: count() }).from(bookMetadata).innerJoin(books, eq(books.id, bookMetadata.bookId)).where(where),
     ]);
 
     return {
@@ -436,7 +472,7 @@ export class BookMetadataFetchQueueRepository {
   }
 
   private previewScopeClause(libraryIds?: readonly number[]): SQL {
-    const parts: SQL[] = [eq(books.status, 'present'), eq(libraries.type, 'books')];
+    const parts: SQL[] = [eq(books.status, 'present')];
     if (libraryIds) parts.push(libraryIds.length > 0 ? inArray(books.libraryId, [...libraryIds]) : sql`false`);
     return and(...parts)!;
   }

@@ -10,7 +10,7 @@ import { assembleBookCards } from '../book/utils/assemble-book-cards';
 import { SmartScopeService } from '../smart-scope/smart-scope.service';
 import { LibraryService } from '../library/library.service';
 import { DashboardRepository, type ScrollerSelectionOptions } from './dashboard.repository';
-import { resolveDashboardLibraryIds } from './dashboard-library-scope';
+import { resolveDashboardLibraryIds, scrollerLibraryIds } from './dashboard-library-scope';
 import { DASHBOARD_SCROLLER_MAX_LIMIT, type DashboardScrollerBatchDto, type DashboardScrollerBatchItemDto } from './dto/dashboard-scroller-batch.dto';
 import { ScrollerType } from './dto/scroller-type.enum';
 
@@ -120,8 +120,6 @@ export class DashboardService {
 
     if (type === ScrollerType.SMART_SCOPE) {
       const resolvedSmartScopeId = this.assertSmartScopeId(smartScopeId);
-      const scope = await this.smartScopeService.findOne(resolvedSmartScopeId, user);
-      if (scope.mediaType !== 'books') return { books: [], total: 0 };
       const accessibleLibraryIds = resolveDashboardLibraryIds(await this.libraryService.findAccessibleLibraryIds(user), user);
       const result = await this.smartScopeService.executeSmartScope(resolvedSmartScopeId, user, 0, clampedLimit, undefined, accessibleLibraryIds);
       return { books: result.items, total: result.total };
@@ -142,7 +140,8 @@ export class DashboardService {
    * recursive CTE in full, and `random` would anti-join the whole library to size a pool it only
    * ever samples. Neither shelf is asked, and neither guesses.
    */
-  private async countScroller(type: Exclude<ScrollerType, 'smart-scope'>, user: RequestUser, accessibleLibraryIds: number[]): Promise<number | null> {
+  private async countScroller(type: Exclude<ScrollerType, 'smart-scope'>, user: RequestUser, dashboardLibraryIds: number[]): Promise<number | null> {
+    const accessibleLibraryIds = scrollerLibraryIds(type, dashboardLibraryIds, user);
     if (accessibleLibraryIds.length === 0) return 0;
 
     const contentFilters = user.isSuperuser ? undefined : user.contentFilters;
@@ -188,8 +187,6 @@ export class DashboardService {
     options: ScrollerSelectionOptions = {},
   ): Promise<number[]> {
     const resolvedSmartScopeId = this.assertSmartScopeId(smartScopeId);
-    const scope = await this.smartScopeService.findOne(resolvedSmartScopeId, user);
-    if (scope.mediaType !== 'books') return [];
     const accessibleLibraryIds = resolveDashboardLibraryIds(await this.libraryService.findAccessibleLibraryIds(user), user);
     return this.smartScopeService.executeSmartScopeBookIds(
       resolvedSmartScopeId,
@@ -211,9 +208,10 @@ export class DashboardService {
     type: Exclude<ScrollerType, 'smart-scope'>,
     user: RequestUser,
     clampedLimit: number,
-    accessibleLibraryIds: number[],
+    dashboardLibraryIds: number[],
     options: ScrollerSelectionOptions = {},
   ): Promise<number[]> {
+    const accessibleLibraryIds = scrollerLibraryIds(type, dashboardLibraryIds, user);
     if (accessibleLibraryIds.length === 0) return [];
 
     const contentFilters = user.isSuperuser ? undefined : user.contentFilters;

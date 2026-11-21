@@ -75,6 +75,26 @@ describe('walkDirectoryTree', () => {
     expect(visited[0]!.filePaths.map((file) => basename(file))).toEqual(['kept.mp3']);
   });
 
+  it('leaves out the directories it is told to skip, with everything under them', async () => {
+    await mkdir(join(root, 'comics', 'Saga'), { recursive: true });
+    await mkdir(join(root, 'comics-extra'), { recursive: true });
+    await writeFile(join(root, 'comics', 'Saga', 'saga.cbz'), 'a');
+    await writeFile(join(root, 'comics-extra', 'extra.cbz'), 'b');
+
+    const { visited } = await collect({ skipDirectories: new Set([join(root, 'comics')]) });
+
+    expect(visited.map((directory) => basename(directory.path))).toEqual([basename(root), 'comics-extra']);
+    expect(visited[0]!.subdirectoryPaths.map((directory) => basename(directory))).toEqual(['comics-extra']);
+  });
+
+  it('walks nothing when the root itself is to be skipped', async () => {
+    await writeFile(join(root, 'book.epub'), 'a');
+
+    const { visited } = await collect({ skipDirectories: new Set([root]) });
+
+    expect(visited).toEqual([]);
+  });
+
   it('reports symlinked entries instead of following them', async () => {
     await writeFile(join(root, 'real.mp3'), 'a');
     await mkdir(join(root, 'target'), { recursive: true });
@@ -109,5 +129,43 @@ describe('walkDirectoryTree', () => {
 
     expect([...skippedDirs]).toEqual([join(root, 'locked')]);
     expect(visited.map((directory) => basename(directory.path))).toEqual([basename(root)]);
+  });
+
+  it('skips a subdirectory that disappears after its parent lists it and keeps walking its siblings', async () => {
+    await mkdir(join(root, 'stale'), { recursive: true });
+    await mkdir(join(root, 'sibling'), { recursive: true });
+    await writeFile(join(root, 'sibling', 'book.epub'), 'a');
+
+    const visited: string[] = [];
+    const messages: string[] = [];
+    const { skippedDirs } = await walkDirectoryTree(root, {
+      logger: (message) => messages.push(message),
+      visit: async (directory) => {
+        visited.push(basename(directory.path));
+        if (directory.path === root) await rm(join(root, 'stale'), { recursive: true });
+      },
+    });
+
+    expect([...skippedDirs]).toEqual([join(root, 'stale')]);
+    expect(visited.sort()).toEqual([basename(root), 'sibling'].sort());
+    expect(messages).toEqual([`Cannot read folder (ENOENT), skipping: ${join(root, 'stale')}`]);
+  });
+
+  it('skips a subdirectory that was replaced by a file after its parent listed it', async () => {
+    await mkdir(join(root, 'swapped'), { recursive: true });
+
+    const { skippedDirs } = await walkDirectoryTree(root, {
+      visit: async (directory) => {
+        if (directory.path !== root) return;
+        await rm(join(root, 'swapped'), { recursive: true });
+        await writeFile(join(root, 'swapped'), 'now a file');
+      },
+    });
+
+    expect([...skippedDirs]).toEqual([join(root, 'swapped')]);
+  });
+
+  it('still fails when the root itself is missing', async () => {
+    await expect(walkDirectoryTree(join(root, 'unmounted'), { visit: () => undefined })).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

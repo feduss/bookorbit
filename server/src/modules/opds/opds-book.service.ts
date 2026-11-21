@@ -1,3 +1,4 @@
+import { LibraryScopeService } from '../../common/library-scope/library-scope.service';
 import { ForbiddenException, Inject, Injectable } from '@nestjs/common';
 import { SQL, type SQLWrapper, type Subquery, and, count, eq, exists, gt, inArray, not, notExists, or, sql } from 'drizzle-orm';
 import { NodePgDatabase } from 'drizzle-orm/node-postgres';
@@ -18,7 +19,6 @@ import {
   libraries,
   readingProgress,
   userBookStatus,
-  userLibraryAccess,
 } from '../../db/schema';
 import { BookQueryBuilder } from '../book/book-query-builder.service';
 import { isAudioFormat, type ContentFilterRules, type GroupRule } from '@bookorbit/types';
@@ -41,6 +41,8 @@ type OpdsBookFilters = {
   readStatus?: 'unread' | 'reading' | 'finished';
   format?: string;
   ids?: number[];
+  // Books to leave out however many there are, such as those already on a reader's device.
+  excludeIds?: number[];
   excludeAudioOnly?: boolean;
 };
 
@@ -77,6 +79,8 @@ type OpdsSortOrder =
   | 'title_desc'
   | 'author_asc'
   | 'author_desc'
+  | 'published_asc'
+  | 'published_desc'
   | 'series_asc'
   | 'series_desc';
 
@@ -94,6 +98,16 @@ const OPDS_SORT_MAP: Record<Exclude<OpdsSortOrder, LastReadSortOrder>, SQL[]> = 
   title_desc: [sql`${bookMetadata.title} DESC NULLS LAST`, sql`${books.id} ASC`],
   author_asc: [sql`${books.primaryAuthorSortName} ASC NULLS LAST`, sql`${bookMetadata.title} ASC NULLS LAST`, sql`${books.id} ASC`],
   author_desc: [sql`${books.primaryAuthorSortName} DESC NULLS LAST`, sql`${bookMetadata.title} ASC NULLS LAST`, sql`${books.id} ASC`],
+  published_asc: [
+    sql`coalesce(${bookMetadata.publishedDate}, make_date(${bookMetadata.publishedYear}, 1, 1)) ASC NULLS LAST`,
+    sql`${bookMetadata.title} ASC NULLS LAST`,
+    sql`${books.id} ASC`,
+  ],
+  published_desc: [
+    sql`coalesce(${bookMetadata.publishedDate}, make_date(${bookMetadata.publishedYear}, 1, 1)) DESC NULLS LAST`,
+    sql`${bookMetadata.title} ASC NULLS LAST`,
+    sql`${books.id} ASC`,
+  ],
   series_asc: [sql`${bookMetadata.seriesName} ASC NULLS LAST`, ...seriesIndexOrderBy(bookMetadata.seriesIndex, 'ASC'), sql`${books.id} ASC`],
   series_desc: [sql`${bookMetadata.seriesName} DESC NULLS LAST`, ...seriesIndexOrderBy(bookMetadata.seriesIndex, 'DESC'), sql`${books.id} ASC`],
 };
@@ -287,30 +301,16 @@ export class OpdsBookService {
     @Inject(DB) private readonly db: Db,
     private readonly queryBuilder: BookQueryBuilder,
     private readonly collectionRepository: OpdsCollectionRepository,
+    private readonly libraryScope: LibraryScopeService,
   ) {}
 
   async getAccessibleLibraryIds(userId: number, isSuperuser = false): Promise<number[]> {
-    if (isSuperuser) {
-      const rows = await this.db.select({ id: libraries.id }).from(libraries);
-      return rows.map((r) => r.id);
-    }
-    const rows = await this.db.select({ libraryId: userLibraryAccess.libraryId }).from(userLibraryAccess).where(eq(userLibraryAccess.userId, userId));
-    return rows.map((r) => r.libraryId);
+    return this.libraryScope.visibleIds({ id: userId, isSuperuser });
   }
 
   async getAccessibleLibraries(userId: number, isSuperuser = false) {
-    if (isSuperuser) {
-      return this.db
-        .select({
-          id: libraries.id,
-          name: libraries.name,
-          bookCount: sql<number>`count(${books.id})::int`,
-        })
-        .from(libraries)
-        .leftJoin(books, and(eq(books.libraryId, libraries.id), eq(books.status, 'present')))
-        .groupBy(libraries.id)
-        .orderBy(libraries.name);
-    }
+    const visible = await this.libraryScope.visibleIdsOrAll({ id: userId, isSuperuser });
+    if (visible !== null && visible.length === 0) return [];
     return this.db
       .select({
         id: libraries.id,
@@ -318,8 +318,8 @@ export class OpdsBookService {
         bookCount: sql<number>`count(${books.id})::int`,
       })
       .from(libraries)
-      .innerJoin(userLibraryAccess, and(eq(userLibraryAccess.libraryId, libraries.id), eq(userLibraryAccess.userId, userId)))
       .leftJoin(books, and(eq(books.libraryId, libraries.id), eq(books.status, 'present')))
+      .where(visible === null ? undefined : inArray(libraries.id, visible))
       .groupBy(libraries.id)
       .orderBy(libraries.name);
   }
@@ -360,7 +360,7 @@ export class OpdsBookService {
 
     if (filters?.collectionId) {
       const [collection] = await this.collectionRepository.findById(filters.collectionId);
-      if (!collection || collection.mediaType !== 'books' || (collection.userId !== userId && !collection.isPublic)) {
+      if (!collection || (collection.userId !== userId && !collection.isPublic)) {
         throw new ForbiddenException('No access to this collection');
       }
     }
@@ -368,7 +368,10 @@ export class OpdsBookService {
     if (filters?.smartScopeId) {
       const where = await this.buildSmartScopeWhere(userId, filters.smartScopeId, accessibleIds, contentFilters, filters.q);
       if (!where) return null;
-      return { where: filters.excludeAudioOnly ? and(where, excludeAudioOnlyBooks())! : where };
+      const narrowed = [where];
+      if (filters.excludeIds?.length) narrowed.push(this.excludeBookIdsClause(filters.excludeIds));
+      if (filters.excludeAudioOnly) narrowed.push(excludeAudioOnlyBooks());
+      return { where: and(...narrowed)! };
     }
 
     const clauses: SQL[] = [inArray(books.libraryId, accessibleIds), eq(books.status, 'present')];
@@ -376,6 +379,8 @@ export class OpdsBookService {
     if (filters?.libraryId) clauses.push(eq(books.libraryId, filters.libraryId));
 
     if (filters?.ids) clauses.push(inArray(books.id, filters.ids));
+
+    if (filters?.excludeIds?.length) clauses.push(this.excludeBookIdsClause(filters.excludeIds));
 
     if (filters?.collectionId) {
       clauses.push(
@@ -417,6 +422,12 @@ export class OpdsBookService {
     if (filters?.excludeAudioOnly) clauses.push(excludeAudioOnlyBooks());
 
     return { where: and(...clauses)!, contextSeries: seriesFilter };
+  }
+
+  // One bound array however long the list: a parameter per id would run into Postgres's
+  // 65,535-parameter limit. Postgres hashes a constant array, so the check stays cheap.
+  private excludeBookIdsClause(ids: number[]): SQL {
+    return sql`${books.id} <> ALL(${sql.param(ids)}::int[])`;
   }
 
   // Content filters bind every reader but a superuser; the audio-only exclusion is the reader's own
@@ -1137,6 +1148,7 @@ export class OpdsBookService {
   async getUserCollections(userId: number, isSuperuser = false, contentFilters?: ContentFilterRules, options: CatalogVisibilityOptions = {}) {
     return this.collectionRepository.findVisibleForUser(
       userId,
+      await this.libraryScope.visibleIdsOrAll({ id: userId, isSuperuser }),
       isSuperuser,
       contentFilters,
       options.excludeAudioOnly ? [excludeAudioOnlyBooks()] : [],
@@ -1154,7 +1166,7 @@ export class OpdsBookService {
     const [row] = await this.db
       .select({ total: count() })
       .from(smartScopes)
-      .where(and(eq(smartScopes.mediaType, 'books'), or(eq(smartScopes.userId, userId), eq(smartScopes.isPublic, true))));
+      .where(or(eq(smartScopes.userId, userId), eq(smartScopes.isPublic, true)));
     return Number(row?.total ?? 0);
   }
 
@@ -1248,7 +1260,7 @@ export class OpdsBookService {
         icon: smartScopes.icon,
       })
       .from(smartScopes)
-      .where(and(eq(smartScopes.mediaType, 'books'), or(eq(smartScopes.userId, userId), eq(smartScopes.isPublic, true))))
+      .where(or(eq(smartScopes.userId, userId), eq(smartScopes.isPublic, true)))
       .orderBy(smartScopes.name);
   }
 
@@ -1281,6 +1293,7 @@ export class OpdsBookService {
     original = false,
   ): Promise<{
     id: number;
+    libraryId: number;
     contentVersion: string;
     mtime: Date | null;
     sizeBytes: number | null;
@@ -1294,6 +1307,7 @@ export class OpdsBookService {
     const candidates = await this.db
       .select({
         id: bookFiles.id,
+        libraryId: books.libraryId,
         absolutePath: bookFiles.absolutePath,
         updatedAt: bookFiles.updatedAt,
         mtime: bookFiles.mtime,
@@ -1336,6 +1350,7 @@ export class OpdsBookService {
 
     return {
       id: file.id,
+      libraryId: file.libraryId,
       contentVersion: file.updatedAt.toISOString(),
       mtime: file.mtime,
       sizeBytes: file.sizeBytes,
@@ -1358,8 +1373,6 @@ export class OpdsBookService {
     const [smartScope] = await this.db.select().from(smartScopes).where(eq(smartScopes.id, smartScopeId)).limit(1);
     if (!smartScope) return null;
     if (!smartScope.isPublic && smartScope.userId !== userId) return null;
-    // OPDS serves books. A podcast scope's rules are not a GroupRule and would not survive buildWhere.
-    if (smartScope.mediaType !== 'books') return null;
 
     const where = this.queryBuilder.buildWhere(smartScope.filter as GroupRule | null, {
       accessibleLibraryIds: accessibleIds,
