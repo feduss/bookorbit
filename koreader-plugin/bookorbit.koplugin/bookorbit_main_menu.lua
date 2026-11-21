@@ -416,6 +416,15 @@ function MainMenu:openBookDetails(book_id)
     end
 end
 
+-- KOReader's own menu, over whatever BookOrbit page is open. Closing it
+-- returns to that page.
+function MainMenu:showKOReaderMenu()
+    local menu = self.ui and self.ui.menu
+    if menu and menu.onShowMenu then
+        menu:onShowMenu()
+    end
+end
+
 -- What the sheet does with a tap it does not handle itself.
 function MainMenu:onMenuSheetAction(page, catalog, action)
     local kind = action.kind
@@ -450,6 +459,8 @@ function MainMenu:onMenuSheetAction(page, catalog, action)
         end)
     elseif kind == "settings" then
         after(function() self:openSettings(catalog) end)
+    elseif kind == "koreader-menu" then
+        after(function() self:showKOReaderMenu() end)
     elseif kind == "status" then
         after(function() self:openSyncStatus() end)
     elseif kind == "about" then
