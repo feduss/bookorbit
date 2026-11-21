@@ -50,6 +50,7 @@ local CatalogDashboard = require("bookorbit_catalog_dashboard")
 local CatalogDetail = require("bookorbit_catalog_detail")
 local CatalogFocus = require("bookorbit_catalog_focus")
 local CatalogLists = require("bookorbit_catalog_lists")
+local CatalogOffline = require("bookorbit_catalog_offline")
 local CatalogThumbnails = require("bookorbit_catalog_thumbnails")
 -- Loaded on first use: specs load this module without KOReader's widgets.
 local Toast = setmetatable({}, { __index = function(_t, key) return require("bookorbit_toast")[key] end })
@@ -254,6 +255,8 @@ CatalogFocus.install(BookOrbitCatalog)
 CatalogThumbnails.install(BookOrbitCatalog)
 -- The list pages (books, authors, series, shelves, search) draw themselves.
 CatalogLists.install(BookOrbitCatalog)
+-- Offline browsing: lists, sections, search and details without a connection.
+CatalogOffline.install(BookOrbitCatalog)
 
 local Menu_recalculateDimen = Menu._recalculateDimen
 local Menu_updateItems = Menu.updateItems
@@ -277,6 +280,7 @@ function BookOrbitCatalog:setApi(api)
         self.settings.catalog_recent_searches = nil
         self.list_libraries = nil
         self._list_keep_jump = nil
+        self:offlineForget()
         if self.bulk_ctx then
             self.bulk_ctx.cancelled = true
             self:bulkReleaseStandby(self.bulk_ctx)
@@ -480,12 +484,13 @@ function BookOrbitCatalog:refreshCurrent()
         local params = cloneParams(context.params or {})
         params.page = context.page or 1
         params.offset = context.offset
-        self:loadBooks(params, context.title or _("Books"), false)
+        -- An explicit refresh asks for a connection, however the list was served.
+        self:loadBooks(params, context.title or _("Books"), false, { online = true })
     elseif context.kind == "dashboard" then
         self:evictCachedCovers(self.dashboardBooks(context.dashboard))
         self:loadDashboardRoot(true)
     elseif context.kind == "section" then
-        self:reloadSection(context.section, { page = context.page, offset = context.offset })
+        self:reloadSection(context.section, { page = context.page, offset = context.offset, online = true })
     elseif context.kind == "detail" and context.detail then
         self:evictCachedCovers(self:detailThumbnailBooks(context.detail))
         self:runConnected(function()
@@ -979,6 +984,9 @@ function BookOrbitCatalog:loadSection(section, opts)
         return self:loadShelves(opts)
     end
     local paged = (section == "authors" or section == "series")
+    -- Without a connection the offline library answers; opts.online is an
+    -- explicit reconnect, which asks for one.
+    if not opts.online and self:offlineServeSection(section, opts) then return end
     self:runConnected(function()
         local params
         if paged then
@@ -996,52 +1004,64 @@ function BookOrbitCatalog:loadSection(section, opts)
             end
             return
         end
-
-        local page = body.page or opts.page or 1
-        local q = body.query or opts.q
-        local item_table = {}
-
-        for _, entry in ipairs(body.items or {}) do
-            local entry_params = self:paramsForEntry(section, entry)
-            table.insert(item_table, {
-                text = entry.title,
-                mandatory = entry.count and tostring(entry.count) or nil,
-                kind = opts.dashboard_source_index and "dashboard-source" or "books",
-                params = entry_params,
-                dashboard_source_index = opts.dashboard_source_index,
-                dashboard_source = opts.dashboard_source_index and {
-                    type = section,
-                    sourceName = entry.title,
-                    params = entry_params,
-                } or nil,
-            })
-        end
-
-        if #item_table == 0 then
-            table.insert(item_table, { text = self:emptyEntriesText(section), enabled = false })
-        end
-        local title = self:titleForSection(section)
-        local push = not opts.replace
-        self:switchTo(title, item_table, {
-            kind = "section",
-            title = title,
-            subtitle = paged and self:sectionSubtitle(page, q, body.hasNext) or "",
-            section = section,
-            page = page,
-            offset = body.offset,
-            q = q,
-            paged = paged,
-            has_next = body.hasNext == true,
-            has_previous = body.hasPrevious == true or page > 1,
-            dashboard_source_index = opts.dashboard_source_index,
-            entries = body.items or {},
-            total = body.total,
-            page_size = body.size or (params and params.size),
-            buckets = body.buckets,
-            sort = body.sort or opts.sort,
-            filter = body.filter or opts.filter or nil,
-        }, push)
+        self:showSectionPage(section, body, params, opts)
     end)
+end
+
+-- The section page for a body the server, or offline the saved library,
+-- answered with. extra: offline_saved_at and offline_library for a page
+-- served without the network.
+function BookOrbitCatalog:showSectionPage(section, body, params, opts, extra)
+    opts = opts or {}
+    extra = extra or {}
+    local paged = (section == "authors" or section == "series")
+    local page = body.page or opts.page or 1
+    local q = body.query or opts.q
+    local item_table = {}
+
+    for _, entry in ipairs(body.items or {}) do
+        local entry_params = self:paramsForEntry(section, entry)
+        table.insert(item_table, {
+            text = entry.title,
+            mandatory = entry.count and tostring(entry.count) or nil,
+            kind = opts.dashboard_source_index and "dashboard-source" or "books",
+            params = entry_params,
+            dashboard_source_index = opts.dashboard_source_index,
+            dashboard_source = opts.dashboard_source_index and {
+                type = section,
+                sourceName = entry.title,
+                params = entry_params,
+            } or nil,
+        })
+    end
+
+    if #item_table == 0 then
+        table.insert(item_table, { text = self:emptyEntriesText(section), enabled = false })
+    end
+    local title = self:titleForSection(section)
+    local push = not opts.replace
+    self:switchTo(title, item_table, {
+        kind = "section",
+        title = title,
+        subtitle = paged and self:sectionSubtitle(page, q, body.hasNext) or "",
+        section = section,
+        page = page,
+        offset = body.offset,
+        q = q,
+        paged = paged,
+        has_next = body.hasNext == true,
+        has_previous = body.hasPrevious == true or page > 1,
+        dashboard_source_index = opts.dashboard_source_index,
+        entries = body.items or {},
+        total = body.total,
+        page_size = body.size or (params and params.size),
+        buckets = body.buckets,
+        sort = body.sort or opts.sort,
+        filter = body.filter or opts.filter or nil,
+        list_offline = extra.offline_saved_at ~= nil or nil,
+        list_saved_at = extra.offline_saved_at,
+        list_offline_library = extra.offline_library,
+    }, push)
 end
 
 function BookOrbitCatalog:reloadSection(section, overrides)
@@ -1142,14 +1162,23 @@ function BookOrbitCatalog:fetchBookPage(params, title, push)
     local body, err = self:fetch(title and T(_("Opening %1…"), title) or _("Opening books…"), function()
         return self.client:catalogBooks(query)
     end)
-    local offline_saved_at
+    local offline_saved_at, offline_library
     if not body then
         if err ~= "cancelled" then
-            -- Unreachable: the page this device saved for the same request.
+            -- Unreachable: the page this device saved for the same request,
+            -- else the offline library's answer.
             local saved = self:listSavedPage(query, err)
+            local library_body, snapshot, library = nil, nil, nil
+            if not saved and type(err) ~= "number" then
+                library_body, snapshot, library = self:offlineBookBody(query)
+            end
             if saved then
                 body = saved.body
                 offline_saved_at = saved.saved_at or 0
+            elseif library_body then
+                body = library_body
+                offline_saved_at = snapshot.saved_at or 0
+                offline_library = library
             else
                 self:showRetry(err, function()
                     self:loadBooks(params, title, push)
@@ -1175,35 +1204,57 @@ function BookOrbitCatalog:fetchBookPage(params, title, push)
     end
     local complete_series = query.seriesId ~= nil or query.series ~= nil
     self:showBookPage(complete, query, title or _("Books"), push ~= false,
-        offline_saved_at and { offline_saved_at = offline_saved_at } or { complete = complete_series })
+        offline_saved_at and { offline_saved_at = offline_saved_at, offline_library = offline_library } or { complete = complete_series })
 end
 
-function BookOrbitCatalog:loadBooks(params, title, push)
+-- Without a connection the list comes from what this device saved, when it
+-- can; only then is a connection asked for. opts.online: an explicit
+-- reconnect, which always asks. A list this device derives (On device, Not
+-- on device) is rebuilt from the on-device map when it goes to the server,
+-- since the saved context names it rather than its books.
+function BookOrbitCatalog:loadBooks(params, title, push, opts)
+    opts = opts or {}
+    params = params or {}
+    if not opts.online and self:offlineServeBooks(params, title, push) then return end
+    if params.not_on_device then return self:loadNotOnDevice() end
+    if params.on_device_filter then
+        params = cloneParams(params)
+        params.ids = self:onDeviceIdsParam()
+        if not params.ids then
+            Toast.show(_("No downloaded books are linked on this device yet"), { icon = "info", timeout = 3 })
+            return
+        end
+    end
     self:runConnected(function()
         self:fetchBookPage(params, title, push)
     end)
 end
 
-function BookOrbitCatalog:loadOnDevice()
+-- The ids filter for the books on this device, within the server's cap (so
+-- never more file checks than that either), or nil when none is linked.
+function BookOrbitCatalog:onDeviceIdsParam()
     self:refreshOnDevice()
     local ids = {}
-    for book_id in pairs(self.on_device) do
+    for book_id in pairs(self.on_device or {}) do
         table.insert(ids, book_id)
-    end
-    if #ids == 0 then
-        Toast.show(_("No downloaded books are linked on this device yet"), { icon = "info", timeout = 3 })
-        return
     end
     table.sort(ids)
     local capped = {}
     for i = 1, math.min(#ids, ON_DEVICE_MAX_IDS) do
         if self:isOnDevice({ id = ids[i] }) then table.insert(capped, ids[i]) end
     end
-    if #capped == 0 then
+    if #capped == 0 then return nil end
+    return table.concat(capped, ",")
+end
+
+function BookOrbitCatalog:loadOnDevice()
+    if self:offlineServeBooks({ sort = "title", on_device_filter = true }, _("On device"), true) then return end
+    local ids = self:onDeviceIdsParam()
+    if not ids then
         Toast.show(_("No downloaded books are linked on this device yet"), { icon = "info", timeout = 3 })
         return
     end
-    self:loadBooks({ ids = table.concat(capped, ","), sort = "title", on_device_filter = true }, _("On device"), true)
+    self:loadBooks({ ids = ids, sort = "title", on_device_filter = true }, _("On device"), true)
 end
 
 function BookOrbitCatalog:collectNotOnDeviceIds()
@@ -1222,6 +1273,7 @@ function BookOrbitCatalog:collectNotOnDeviceIds()
 end
 
 function BookOrbitCatalog:loadNotOnDevice()
+    if self:offlineServeBooks({ sort = "recently_added", not_on_device = true }, _("Not on device"), true) then return end
     self:runConnected(function()
         -- Without the maps every book reads as absent, which would list books
         -- that are already here. refreshOnDevice starts the scan; the list is
@@ -1401,6 +1453,7 @@ function BookOrbitCatalog:showBookPage(body, query, title, push, opts)
         on_device_filter = query.on_device_filter,
         list_offline = opts.offline_saved_at ~= nil or nil,
         list_saved_at = opts.offline_saved_at,
+        list_offline_library = opts.offline_library,
     }, push)
 
     if not opts.offline_saved_at and not opts.complete then
@@ -2405,7 +2458,7 @@ function BookOrbitCatalog:onMenuSelect(item)
         if resume_path then
             self:openDownloadedFile(resume_path)
         else
-            self:loadBookDetail(item.book_id, { list = item.list })
+            self:loadBookDetail(item.book_id, { list = item.list, book = item.book })
         end
     elseif item.kind == "section-filter" then
         local context = self.current_context or {}
@@ -2528,6 +2581,7 @@ function BookOrbitCatalog:onCloseWidget()
     self.catalog_closed = true
     self.dashboard_request_generation = self.dashboard_request_generation + 1
     self.on_device_hydration_generation = self.on_device_hydration_generation + 1
+    self.offline_snapshot_generation = (self.offline_snapshot_generation or 0) + 1
     self:cancelThumbnailJobs()
     if self.bulk_ctx then
         local ctx = self.bulk_ctx

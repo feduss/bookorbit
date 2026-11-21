@@ -12,6 +12,7 @@ local function run(failed_stage, failure, populated)
     local calls, retries, switched = 0, {}, nil
     local catalog = setmetatable({ client = {} }, { __index = Lists })
     function catalog:recordRecentSearch() end
+    function catalog:offlineServeSearch() return false end
     function catalog:runConnected(fn) fn() end
     function catalog:withLoading(_, fn) fn() end
     function catalog:listEnsureCapabilities() end

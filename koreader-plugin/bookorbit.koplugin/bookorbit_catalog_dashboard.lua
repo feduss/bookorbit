@@ -272,6 +272,12 @@ function CatalogDashboard:loadDashboardRoot(replace, opts)
             context.board_page = expected_context.board_page
         end
         self:switchTo(context.title or self.title, items, context, not replace)
+        -- A fresh Home means the server answered: the books queued offline
+        -- are offered, and the offline library refreshes behind the covers.
+        if context.kind == "dashboard" and not context.stale then
+            if self.offlineOfferQueuedDownloads then self:offlineOfferQueuedDownloads() end
+            if self.offlineSnapshotSchedule then self:offlineSnapshotSchedule() end
+        end
     end)
 end
 

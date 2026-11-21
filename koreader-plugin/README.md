@@ -82,6 +82,18 @@ Position-only bookmarks (dogears) sync the same way:
 
 New bookmarks retain their source file. Mapping into a structurally different sibling requires equivalent chapter text; otherwise the bookmark remains unresolved. Legacy bookmarks without source-file provenance remain listed, but the selected-file web reader and delivery to another device withhold their position until a source-device sync or a new bookmark request establishes it. Device-side renames update BookOrbit; an already-linked second device keeps its existing title because bookmark exchange has no edit operation.
 
+## Offline
+
+The dashboard opens from its cache without Wi-Fi, and so does everything behind it:
+
+- **On device** and **Not on device** come from the plugin's own map of downloaded books. A downloaded book the library has not seen yet is listed by its KOReader sidecar title, else its file name.
+- **Every other list, Authors, Series, Shelves and search** come from the offline library: a bounded snapshot of your account's books (the newest of each library up to Settings > Offline > Books to keep, plus every book on this device, every book in progress, and the books of your first collections and SmartScopes), with the libraries, collections and scopes themselves. It is saved in the background after Home refreshes while connected, at most every 6 hours, and from Settings > Offline > Save the library now at any time. Sorting, filtering and the A-Z rail keep working on a saved list; the band above the list says when the library was saved and, for a library larger than the limit, how much of it is there. Tapping the band reconnects.
+- **Book details** open from the detail cache (books you looked at recently, with books on this device kept longest) or from the book's saved summary. A book on this device reads; any other shows **Download when online**, which queues it. The next time the catalog opens connected, the queued books are offered as one bulk download (also from Settings > Offline > Queued downloads).
+- A page this device already loaded is still shown as before when the server cannot be reached, even for a collection the snapshot did not walk.
+- Only what truly needs the server asks for a connection: a list nothing saved can answer, an explicit refresh, the band's reconnect, downloads, status and rating changes.
+
+The offline library is kept per server and account under KOReader's cache directory and removed on sign-out, from Settings > Offline > Clear, or by turning the feature off.
+
 ## Limitations
 
 - Web highlight changes reach a closed book only via a manual sweep or its next open.
@@ -90,6 +102,7 @@ New bookmarks retain their source file. Mapping into a structurally different si
 - PDF bookmarks don't sync in either direction (the web has no PDF bookmark surface).
 - A device clock far in the past can delay edit detection for web-modified highlights.
 - The full sweep is manual-only; books you never reopen only sync when you run it.
+- Offline, a collection or SmartScope beyond the first 12 of each, an author the snapshot holds no book of, and read status or rating changes still need a connection; the snapshot holds the newest books up to the chosen limit, so a very large library is browsed in part until you connect.
 - A cloned device with a different KOReader `device_id` double-counts reading time; clones keeping the same `device_id` deduplicate naturally.
 
 ### EPUB delivery defaults

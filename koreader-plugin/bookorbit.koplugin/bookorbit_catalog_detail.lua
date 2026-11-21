@@ -205,10 +205,23 @@ function CatalogDetail:cacheBookDetail(detail)
             cachedAt = type(entry) == "table" and tonumber(entry.cachedAt) or 0,
         })
     end
+    -- Oldest first, but a book on this device outlives one that is not: its
+    -- details are what an offline open shows.
     if #entries > DETAIL_CACHE_MAX_BOOKS then
         table.sort(entries, function(a, b) return a.cachedAt < b.cachedAt end)
-        for i = 1, #entries - DETAIL_CACHE_MAX_BOOKS do
-            cache[entries[i].key] = nil
+        local over = #entries - DETAIL_CACHE_MAX_BOOKS
+        for _, pass in ipairs({ "absent", "any" }) do
+            for _, entry in ipairs(entries) do
+                if over == 0 then break end
+                if cache[entry.key] then
+                    local id = tonumber(entry.key:match("|(%d+)$"))
+                    local on_device = id ~= nil and self.on_device ~= nil and self.on_device[id] ~= nil
+                    if pass == "any" or not on_device then
+                        cache[entry.key] = nil
+                        over = over - 1
+                    end
+                end
+            end
         end
     end
     self:persistSetting("catalog_detail_cache", cache)
@@ -280,11 +293,16 @@ function CatalogDetail:showBookActionSheetForEntry(item)
     local book_id = item and (item.book_id or (item.book and item.book.id))
     if not book_id then return end
     local cached = self:cachedBookDetail(book_id)
-    if cached and not NetworkMgr:isConnected() then
-        self:showBookActionSheet(cached, {
-            allow_select = item.kind == "book" and self:bookMode(),
-        })
-        return
+    if not NetworkMgr:isConnected() then
+        -- Offline: the cached details, else what the list or the offline
+        -- library knows of the book.
+        local offline = cached or self:offlineDetail(book_id, item.book)
+        if offline then
+            self:showBookActionSheet(offline, {
+                allow_select = item.kind == "book" and self:bookMode(),
+            })
+            return
+        end
     end
     local title = (item.book and item.book.title) or (cached and cached.title)
     self:runConnected(function()
@@ -352,12 +370,17 @@ end
 
 -- opts.push opens the book on top of this one (a related book), so Back
 -- returns here; without it a detail page replaces the one shown (the pager).
+-- opts.book: the list entry the book was tapped in, which stands in for its
+-- details offline when none were cached.
 function CatalogDetail:loadBookDetail(book_id, opts)
     opts = opts or {}
     local cached = self:cachedBookDetail(book_id)
-    if cached and not NetworkMgr:isConnected() then
-        self:showBookDetail(cached, { stale = true, push = opts.push, list = opts.list })
-        return
+    if not NetworkMgr:isConnected() then
+        local offline = cached or self:offlineDetail(book_id, opts.book)
+        if offline then
+            self:showBookDetail(offline, { stale = true, push = opts.push, list = opts.list })
+            return
+        end
     end
     local title = opts.title or (cached and cached.title)
     self:runConnected(function()
@@ -707,10 +730,14 @@ function CatalogDetail:detailRun(action, region, hold)
         end
         return self:showDetailHighlights(d)
     elseif kind == "get" then
+        -- A page built from a saved summary names no files to download; the
+        -- real details come first.
+        if detail.offline_summary then return self:refreshCurrent() end
         return self:downloadDefaultFile(detail, action.file)
     elseif kind == "download-options" then
         context.detail_sheet = nil
         self:updateItems(nil, true)
+        if detail.offline_summary then return self:refreshCurrent() end
         return self:showDownloadOptions(detail)
     elseif kind == "refresh" then
         context.detail_sheet = nil
@@ -736,7 +763,19 @@ function CatalogDetail:detailPrimary(d, detail, from_cover)
         if d.read_path then return self:openDownloadedFile(d.read_path) end
     elseif from_cover then
         return
+    elseif p.kind == "offline" or p.kind == "queued" then
+        -- Offline the button queues the book, and the next connected open of
+        -- the catalog offers to download the queue.
+        local queued = self:offlineToggleQueued(detail)
+        if queued == nil then
+            Toast.error(_("The download queue is full. Connect to download the books in it first."))
+            return
+        end
+        self:updateItems(nil, true)
+        Toast.show(queued and _("Queued. It downloads when you are back online.") or _("Removed from the download queue"), { icon = queued and "check" or "x" })
+        return
     elseif p.kind == "download" and p.entry then
+        if detail.offline_summary then return self:refreshCurrent() end
         return self:downloadDefaultFile(detail, p.entry.file)
     elseif p.kind == "downloading" then
         -- The button is the cancel control while it fills.

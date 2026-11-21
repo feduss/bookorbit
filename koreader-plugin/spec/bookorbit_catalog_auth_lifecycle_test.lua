@@ -57,6 +57,11 @@ package.loaded["bookorbit_sweep"] = {
         return { lastSweepAt = 0, matched = 0, unmatched = 0 }
     end,
 }
+local cleared_offline = {}
+package.loaded["bookorbit_offline_library"] = {
+    accountKey = function(client) return tostring(client.server_url) .. "|" .. tostring(client.username) end,
+    clear = function(account) table.insert(cleared_offline, account) end,
+}
 
 package.path = "koreader-plugin/bookorbit.koplugin/?.lua;" .. package.path
 
@@ -87,6 +92,9 @@ local function newPlugin()
                 userkey = self.settings.userkey,
                 background_requests = background_requests == true,
             }
+        end,
+        newClient = function(self)
+            return self:apiOpts(true)
         end,
         catalog_browser = {
             setApi = function(_, api)
@@ -120,8 +128,13 @@ assertEqual(ignored_input[1], true, "login suppresses input while authenticating
 assertEqual(ignored_input[2], false, "login restores input after authenticating")
 
 plugin.settings.catalog_dashboard_cache = { displayName = "Signed-out account" }
+plugin.settings.offline_library_status = { account = "x", count = 3 }
+plugin.settings.offline_download_queue = { ["https://old.example/api/v1|new-user"] = { { id = 1 } } }
 plugin:logout(menu)
 assertEqual(plugin.settings.catalog_dashboard_cache, nil, "logout discards the cached dashboard")
+assertEqual(cleared_offline[#cleared_offline], "https://old.example/api/v1|new-user", "logout removes the account's offline library")
+assertEqual(plugin.settings.offline_library_status, nil, "and forgets its status")
+assertEqual(plugin.settings.offline_download_queue, nil, "and its download queue")
 assertEqual(plugin.settings.userkey, nil, "logout clears the stored key")
 assertEqual(#applied_api, 2, "logout rebinds the active catalog")
 assertEqual(applied_api[2].userkey, nil, "logout invalidates the catalog client key")

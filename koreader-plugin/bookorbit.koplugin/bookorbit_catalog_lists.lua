@@ -74,6 +74,9 @@ end
 -- transient failure, so a later list asks again.
 function CatalogLists:listEnsureCapabilities()
     if Capabilities.cached(self.client) then return end
+    -- Offline the version request cannot be made; the capabilities the
+    -- offline library was saved against stand in.
+    if not NetworkMgr:isConnected() then return self:offlineAdoptCapabilities() end
     local body, err = self:fetch(nil, function() return self.client:getPluginVersion() end, { invisible = true })
     if body then
         Capabilities.remember(self.client, body)
@@ -128,8 +131,19 @@ function CatalogLists:listCapacity(kind, view, params, opts)
     local sw, sh = self:listScreen()
     local rail = self:listAlphabetical(kind, params) and self:listsSupported()
     if kind == "reading" then rail = false end
-    -- Offline the band takes the toolbar's place.
-    return ListPages.capacity(sw, sh, { toolbar = not opts.offline, offline = opts.offline, rail = rail, view = view, kind = kind })
+    -- Offline the band takes the toolbar's place, unless the list comes from
+    -- the offline library, which sorts and filters on its own.
+    local toolbar = not opts.offline
+    if opts.toolbar ~= nil then toolbar = opts.toolbar == true end
+    return ListPages.capacity(sw, sh, { toolbar = toolbar, offline = opts.offline, rail = rail, view = view, kind = kind })
+end
+
+-- How a list served without the network is laid out: the band, and the
+-- toolbar only when the offline library can act on it.
+function CatalogLists:listOfflineLayout(context)
+    context = context or self.current_context or {}
+    if not context.list_offline then return {} end
+    return { offline = true, toolbar = context.list_offline_library ~= nil }
 end
 
 -- ---------------------------------------------------------- saved pages
@@ -217,10 +231,10 @@ end
 
 -- The server page size for a book list. A series or an author page draws
 -- all its books (local pages when there are more than fit).
-function CatalogLists:listBookPageSize(params)
+function CatalogLists:listBookPageSize(params, opts)
     local kind = self:listKind({ kind = "books", params = params })
     if kind == "seriespage" or kind == "authorpage" then return 100 end
-    return math.min(100, self:listCapacity(kind, self:listView(kind), params))
+    return math.min(100, self:listCapacity(kind, self:listView(kind), params, opts))
 end
 
 -- --------------------------------------------------------------- loading
@@ -242,7 +256,7 @@ function CatalogLists:listAdoptBookBody(context, body)
 end
 
 -- A section (authors, series): one screen per request on newer servers.
-function CatalogLists:listSectionParams(section, opts)
+function CatalogLists:listSectionParams(section, opts, layout)
     local params = {}
     if opts.offset and self:listOffsets() then params.offset = opts.offset
     elseif opts.page and opts.page > 1 then params.page = opts.page end
@@ -250,7 +264,7 @@ function CatalogLists:listSectionParams(section, opts)
     if self:listsSupported() then
         local kind = section
         local sort = opts.sort or "name"
-        params.size = self:listCapacity(kind, self:listView(kind), { sort = sort })
+        params.size = self:listCapacity(kind, self:listView(kind), { sort = sort }, layout)
         if sort ~= "name" then params.sort = sort end
         if opts.filter then params.filter = opts.filter end
     end
@@ -261,6 +275,7 @@ end
 -- opts.dashboard_source_index: picking one for a shelf on Home.
 function CatalogLists:loadShelves(opts)
     opts = opts or {}
+    if not opts.online and self:offlineServeShelves(opts) then return end
     self:runConnected(function()
         local bodies = {}
         for _i, section in ipairs({ "libraries", "collections", "smart-scopes" }) do
@@ -271,21 +286,32 @@ function CatalogLists:loadShelves(opts)
             end
             bodies[section] = body.items or {}
         end
-        local item_table = {}
-        for _i, section in ipairs({ "libraries", "collections", "smart-scopes" }) do
-            for _j, entry in ipairs(bodies[section]) do
-                table.insert(item_table, { text = entry.title, kind = "books", params = self:paramsForEntry(section, entry), entry = entry })
-            end
-        end
-        self:switchTo(_("Shelves"), item_table, {
-            kind = "section",
-            section = "shelves",
-            title = _("Shelves"),
-            shelves = bodies,
-            page = 1,
-            dashboard_source_index = opts.dashboard_source_index,
-        }, not opts.replace)
+        self:showShelvesPage(bodies, opts)
     end)
+end
+
+-- The Shelves page for the three lists. extra: offline_saved_at and
+-- offline_library when they come from the offline library.
+function CatalogLists:showShelvesPage(bodies, opts, extra)
+    opts = opts or {}
+    extra = extra or {}
+    local item_table = {}
+    for _i, section in ipairs({ "libraries", "collections", "smart-scopes" }) do
+        for _j, entry in ipairs(bodies[section] or {}) do
+            table.insert(item_table, { text = entry.title, kind = "books", params = self:paramsForEntry(section, entry), entry = entry })
+        end
+    end
+    self:switchTo(_("Shelves"), item_table, {
+        kind = "section",
+        section = "shelves",
+        title = _("Shelves"),
+        shelves = bodies,
+        page = 1,
+        dashboard_source_index = opts.dashboard_source_index,
+        list_offline = extra.offline_saved_at ~= nil or nil,
+        list_saved_at = extra.offline_saved_at,
+        list_offline_library = extra.offline_library,
+    }, not opts.replace)
 end
 
 -- Global search: authors, series and books for one query.
@@ -294,6 +320,7 @@ function CatalogLists:listSearch(q, opts)
     q = require("util").trim(q or "")
     if q == "" then return end
     self:recordRecentSearch(q)
+    if not opts.online and self:offlineServeSearch(q, opts) then return end
     self:runConnected(function() self:withLoading(T(_("Searching for “%1”…"), q), function()
         self:listEnsureCapabilities()
         local authors, series, books
@@ -315,20 +342,30 @@ function CatalogLists:listSearch(q, opts)
         authors = a_body.items or {}
         series = s_body.items or {}
         books = b_body.items or {}
-        self:switchTo(T(_("Search: %1"), q), (function()
-            local t = {}
-            for _i, b in ipairs(books) do table.insert(t, { kind = "book", book_id = b.id, book = b, text = b.title }) end
-            return t
-        end)(), {
-            kind = "search",
-            title = _("Search"),
-            query = q,
-            scope = opts.scope or "all",
-            results = { authors = authors, series = series, books = books, books_total = b_body.total or #books },
-            books = books,
-            page = 1,
-        }, not opts.replace)
+        self:showSearchPage(q, { authors = authors, series = series, books = books, books_total = b_body.total or #books }, opts)
     end) end)
+end
+
+-- The search page for its three lists. extra: offline_saved_at and
+-- offline_library when the offline library answered.
+function CatalogLists:showSearchPage(q, results, opts, extra)
+    opts = opts or {}
+    extra = extra or {}
+    local books = results.books or {}
+    local t = {}
+    for _i, b in ipairs(books) do table.insert(t, { kind = "book", book_id = b.id, book = b, text = b.title }) end
+    self:switchTo(T(_("Search: %1"), q), t, {
+        kind = "search",
+        title = _("Search"),
+        query = q,
+        scope = opts.scope or "all",
+        results = { authors = results.authors or {}, series = results.series or {}, books = books, books_total = results.books_total or #books },
+        books = books,
+        page = 1,
+        list_offline = extra.offline_saved_at ~= nil or nil,
+        list_saved_at = extra.offline_saved_at,
+        list_offline_library = extra.offline_library,
+    }, not opts.replace)
 end
 
 -- Reloads the current list with changed params (sort, filter, view, page).
@@ -348,7 +385,7 @@ function CatalogLists:listReload(opts)
         else
             params.page = opts.page or 1
         end
-        self:loadBooks(params, context.title or _("Books"), false)
+        self:loadBooks(params, context.title or _("Books"), false, { online = opts.online })
     elseif kind == "authors" or kind == "series" then
         local page = opts.page or 1
         local offset
@@ -360,11 +397,12 @@ function CatalogLists:listReload(opts)
             page = page, offset = offset, q = context.q, replace = true,
             sort = opts.sort or context.sort, filter = opts.filter ~= nil and (opts.filter or nil) or context.filter,
             dashboard_source_index = context.dashboard_source_index,
+            online = opts.online,
         })
     elseif kind == "shelves" then
-        self:loadShelves({ replace = true })
+        self:loadShelves({ replace = true, online = opts.online })
     elseif kind == "search" then
-        self:listSearch(context.query, { replace = true, scope = context.scope })
+        self:listSearch(context.query, { replace = true, scope = context.scope, online = opts.online })
     end
 end
 
@@ -481,7 +519,7 @@ end
 -- older server's 60.
 function CatalogLists:listSectionEntries(context)
     local all = context.entries or {}
-    local per = self:listCapacity(self:listKind(context), self:listView(self:listKind(context)), { sort = context.sort })
+    local per = self:listCapacity(self:listKind(context), self:listView(self:listKind(context)), { sort = context.sort }, self:listOfflineLayout(context))
     -- Never more than a screen, whatever size the server sent.
     if context.page_size then
         if #all <= per then return all end
@@ -588,11 +626,7 @@ function CatalogLists:listApplySheet()
         if context.on_device_filter and not s.on_device and title == _("On device") then
             title = _("Library")
         end
-        self:runConnected(function()
-            self:fetchBookPage(params, title, false)
-            local now = self.current_context
-            if now and now.kind == "books" then now.on_device_filter = s.on_device == true end
-        end)
+        self:loadBooks(params, title, false)
         return
     end
     if kind == "authors" or kind == "series" then
@@ -779,17 +813,17 @@ function CatalogLists:listRun(action, region, hold)
             local book = action.book
             if book then return self:bulkToggleEntry({ kind = "book", book = book, book_id = book.id }) end
         end
+        -- Offline a book on this device opens at once; any other opens its
+        -- saved details, where it can be queued for download.
         if context.list_offline then
             local path = self:onDeviceBookPath(action.book)
             if type(path) == "string" and path ~= "" then return self:openDownloadedFile(path) end
-            require("bookorbit_toast").error(_("This book is not on this device. Connect to BookOrbit to download it."))
-            return
         end
         local list = nil
         if context.kind == "search" then list = { books = context.books, label = _("Search") } end
-        return self:loadBookDetail(action.book.id, list and { list = list } or nil)
+        return self:loadBookDetail(action.book.id, { list = list, book = action.book })
     elseif kind == "reconnect" then
-        return self:listReload({ page = context.page })
+        return self:listReload({ page = context.page, online = true })
     elseif (kind == "open-author" or kind == "open-series" or kind == "open-shelf") and context.dashboard_source_index then
         -- Picking for a Home shelf: the row is the pick.
         local e = action.entry or action.shelf
@@ -939,6 +973,7 @@ function CatalogLists:listModel(context, kind)
     local params = context.params or {}
     local m = { kind = kind == "reading" and "books" or kind, view = view, screen_w = sw, screen_h = sh }
     m.offline = context.list_offline and {} or nil
+    local layout = self:listOfflineLayout(context)
     local supported = self:listsSupported()
     local present = ListData.presentLetters(context.buckets)
     local alpha
@@ -949,7 +984,7 @@ function CatalogLists:listModel(context, kind)
     local select = self:isBulkSelectionActive()
     if kind == "books" or kind == "reading" then
         m.entries = context.books or {}
-        local per = self:listCapacity(kind, view, params, { offline = context.list_offline })
+        local per = self:listCapacity(kind, view, params, layout)
         if #m.entries > per then
             local out = {}
             for i = 1, per do out[i] = m.entries[i] end
@@ -1255,7 +1290,7 @@ function CatalogLists:listBody(kind, context)
         return function(f) return ListPages.authorBody(m, f) end, m
     end
     local m = self:listModel(context, kind)
-    m.toolbar = (not context.list_offline) or nil
+    m.toolbar = self:listOfflineLayout(context).toolbar ~= false or nil
     return function(f) return ListPages.listBody(m, f) end, m
 end
 
@@ -1263,10 +1298,22 @@ end
 function CatalogLists:listOfflineBand(context)
     local saved = tonumber(context.list_saved_at)
     local ago = saved and saved > 0 and BoardData.relativeDay(os.date("!%Y-%m-%dT%H:%M:%SZ", saved)) or nil
-    return {
-        note = ago and T(_("saved list from %1. Books on this device open."), ago) or _("saved list. Books on this device open."),
-        action = { kind = "reconnect" },
-    }
+    local library = context.list_offline_library
+    local note
+    if library and context.on_device_filter then
+        note = ago and T(_("books on this device · library saved %1"), ago) or _("books on this device")
+    elseif library then
+        local count = tostring(library.count or 0)
+        if library.truncated and library.total then
+            note = ago and T(_("library saved %1 · newest %2 of %3 books"), ago, count, tostring(library.total))
+                or T(_("saved library · newest %1 of %2 books"), count, tostring(library.total))
+        else
+            note = ago and T(_("library saved %1"), ago) or _("saved library")
+        end
+    else
+        note = ago and T(_("saved list from %1. Books on this device open."), ago) or _("saved list. Books on this device open.")
+    end
+    return { note = note, action = { kind = "reconnect" } }
 end
 
 -- Builds and shows the current list page.
@@ -1286,8 +1333,8 @@ function CatalogLists:updateListPage(select_number, no_recalculate_dimen)
     local sw, sh = self:listScreen()
     local body, m = self:listBody(kind, context)
     -- Offline the band stands in for the toolbar: sorting, filtering and the
-    -- view all need the server.
-    local has_toolbar = (kind == "books" or kind == "reading" or kind == "authors" or kind == "series") and not context.list_offline
+    -- view all need the server, unless the offline library serves the list.
+    local has_toolbar = (kind == "books" or kind == "reading" or kind == "authors" or kind == "series") and self:listOfflineLayout(context).toolbar ~= false
     local toolbar = nil
     if has_toolbar then
         local buttons = self:listToolbar(kind, context)

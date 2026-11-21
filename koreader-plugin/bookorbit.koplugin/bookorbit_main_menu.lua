@@ -695,6 +695,19 @@ end
 function MainMenu:clearAccountCaches()
     self.settings.catalog_dashboard_cache = nil
     self.settings.catalog_detail_cache = nil
+    -- The offline library and the download queue belong to the account too.
+    local OfflineLibrary = require("bookorbit_offline_library")
+    local ok, client = pcall(self.newClient, self)
+    local account = ok and client and OfflineLibrary.accountKey(client) or nil
+    if account then
+        pcall(OfflineLibrary.clear, account)
+        local queue = self.settings.offline_download_queue
+        if type(queue) == "table" then
+            queue[account] = nil
+            if next(queue) == nil then self.settings.offline_download_queue = nil end
+        end
+    end
+    self.settings.offline_library_status = nil
 end
 
 function MainMenu:logout(menu)

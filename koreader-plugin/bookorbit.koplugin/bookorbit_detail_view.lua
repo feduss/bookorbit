@@ -275,7 +275,8 @@ local function primaryButton(d, o)
         })
         return BoardUI.box({ w = w, h = h, radius = math.floor(h / 2), border = ring, border_col = INK.black, bg = INK.white }, track)
     end
-    local kind = (p.kind == "offline" or p.kind == "none") and "disabled" or "solid"
+    -- Offline the button is a choice, not a dead end: it queues the book.
+    local kind = p.kind == "none" and "disabled" or (p.kind == "offline" or p.kind == "queued") and "outline" or "solid"
     local labels = p.labels or { "" }
     local label = labels[1]
     if w then

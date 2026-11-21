@@ -11,6 +11,7 @@ local catalog = {
         self.stack = {}
     end,
     hydrateOnDeviceMaps = function() hydrations = hydrations + 1 end,
+    offlineForget = function() end,
 }
 local env = setmetatable({
     BookOrbitCatalog = catalog,
