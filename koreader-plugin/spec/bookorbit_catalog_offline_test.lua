@@ -337,6 +337,16 @@ assertEqual(catalog:offlineToggleQueued({ id = 8 }), false, "a second tap takes 
 assertEqual(catalog:offlineIsQueued(8), false, "so it is no longer queued")
 assertEqual(catalog:offlineOfferQueuedDownloads(), false, "offline nothing is offered")
 connected = true
+-- A queued book downloaded by hand before the offer leaves the queue unasked.
+catalog:offlineToggleQueued({ id = 10, title = "Kids 10" })
+catalog.on_device[10] = "/books/kids-10.epub"
+assertEqual(catalog:offlineIsQueued(10), true, "queued, then downloaded by hand")
+catalog:offlineToggleQueued({ id = 9 })
+assertEqual(catalog:offlineOfferQueuedDownloads(), false, "a queue of books already here is nothing to offer")
+assertEqual(catalog.settings.offline_download_queue, nil, "and is emptied")
+catalog.offline_queue_offered = nil
+catalog:offlineToggleQueued({ id = 9, title = "Kids 9" })
+catalog:offlineToggleQueued({ id = 10, title = "Kids 10" })
 assertEqual(catalog:offlineOfferQueuedDownloads(), true, "connected, the queue is offered")
 assertEqual(#confirms, 1, "in a dialog")
 assertEqual(confirms[1].title, "Download 1 book chosen offline?", "that counts the books")

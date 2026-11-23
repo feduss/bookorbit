@@ -345,11 +345,28 @@ function CatalogOffline:offlineClearQueue()
     self:persistSetting("offline_download_queue", next(all) and all or nil)
 end
 
+-- Drops the queued books that reached the device another way, for example
+-- downloaded by hand once connected. Returns the books still waiting.
+function CatalogOffline:offlinePruneQueue()
+    local list, all = self:offlineQueue()
+    if #list == 0 then return list end
+    self:refreshOnDevice()
+    local kept = {}
+    for _, entry in ipairs(list) do
+        if not self:isOnDevice({ id = entry.id }) then table.insert(kept, entry) end
+    end
+    if #kept ~= #list then
+        all[self:offlineAccount()] = #kept > 0 and kept or nil
+        self:persistSetting("offline_download_queue", next(all) and all or nil)
+    end
+    return kept
+end
+
 -- Once per catalog session while connected: offers to download the books
 -- queued offline, through the ordinary bulk download.
 function CatalogOffline:offlineOfferQueuedDownloads()
     if self.offline_queue_offered or not NetworkMgr:isConnected() then return false end
-    local list = self:offlineQueue()
+    local list = self:offlinePruneQueue()
     if #list == 0 then return false end
     self.offline_queue_offered = true
     local books = {}
