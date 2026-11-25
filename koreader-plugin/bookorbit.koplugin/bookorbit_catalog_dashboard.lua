@@ -91,7 +91,7 @@ end
 -- cached dashboard is already on screen. Returning to the dashboard later
 -- keeps the cache while offline rather than asking again.
 function CatalogDashboard:refreshDashboardOnOpen()
-    if self:shouldRefreshDashboardOnOpen() then
+    if self:dashboardMode() and self:shouldRefreshDashboardOnOpen() then
         self:loadDashboardRoot(true, { invisible = true })
     end
     self.prefer_cached_dashboard = true

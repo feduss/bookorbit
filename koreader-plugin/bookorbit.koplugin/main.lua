@@ -973,6 +973,8 @@ function BookOrbit:onDispatcherRegisterActions()
         { category = "none", event = "BookOrbitPullProgress", title = _("BookOrbit: pull progress"), reader = true })
     Dispatcher:registerAction("bookorbit_this_book",
         { category = "none", event = "BookOrbitThisBook", title = _("BookOrbit: this book"), reader = true })
+    Dispatcher:registerAction("bookorbit_back",
+        { category = "none", event = "BookOrbitBack", title = _("BookOrbit: back"), reader = true })
     -- The action id predates the rename and is kept for existing gestures.
     Dispatcher:registerAction("bookorbit_open_dashboard",
         { category = "none", event = "BookOrbitOpenDashboard", title = _("BookOrbit: open"), general = true, separator = true })
@@ -1215,6 +1217,17 @@ function BookOrbit:openCatalogBrowser(prefer_cached_dashboard)
         end,
         _manager = self,
         close_callback = function()
+            local catalog = self.catalog_browser
+            if catalog then
+                -- ReaderUI gets a separate plugin instance; PluginShare carries
+                -- the live navigation data across the document switch.
+                PluginShare.bookorbit_previous_catalog = {
+                    stack = catalog.stack,
+                    context = catalog.current_context,
+                    item_table = catalog.item_table,
+                    focus = catalog:captureFocus(),
+                }
+            end
             UIManager:close(self.catalog_browser)
             self.catalog_browser = nil
         end,
@@ -1388,6 +1401,48 @@ function BookOrbit:onBookOrbitThisBook()
         self:openBookSheet()
     end
     return true
+end
+
+function BookOrbit:restorePreviousCatalog()
+    local previous = PluginShare.bookorbit_previous_catalog
+    if type(previous) ~= "table" or type(previous.context) ~= "table"
+        or type(previous.item_table) ~= "table" then
+        return false
+    end
+    if not self:isLoggedIn() then
+        self:promptLogin()
+        return true
+    end
+
+    self:openCatalogBrowser(true)
+    local catalog = self.catalog_browser
+    if not catalog then return false end
+
+    catalog.stack = previous.stack or {}
+    catalog.current_context = previous.context
+    catalog.item_table = previous.item_table
+    catalog:updateReturnPath()
+    catalog:restoreFocusOnNextUpdate(previous.focus)
+    local context = catalog.current_context
+    local title = context.title or catalog.title
+    local subtitle = context.subtitle or ""
+    catalog:resetTitleBar(title, subtitle)
+    catalog:switchItemTable(title, catalog.item_table, nil, nil, subtitle)
+    catalog:updateLeftIcon()
+    PluginShare.bookorbit_previous_catalog = nil
+    return true
+end
+
+function BookOrbit:onBookOrbitBack()
+    if self.catalog_browser then
+        if UIManager:getTopmostVisibleWidget() == self.catalog_browser then
+            return self.catalog_browser:onClose()
+        end
+        UIManager:show(self.catalog_browser)
+        return true
+    end
+    if self:restorePreviousCatalog() then return true end
+    return self:onBookOrbitOpenDashboard()
 end
 
 -- "Make BookOrbit home": the file browser a closed book returns to opens
