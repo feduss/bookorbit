@@ -21,6 +21,7 @@ local BoardUI = require("bookorbit_board_ui")
 local DownloadRoot = require("bookorbit_download_root")
 local MenuPage = require("bookorbit_menu_page")
 local MenuUI = require("bookorbit_menu_ui")
+local OfflineLibrary = require("bookorbit_offline_library")
 local Shortcut = require("bookorbit_shortcut")
 
 local INK = BoardMetrics.INK
@@ -85,6 +86,52 @@ local function downloadDir()
     return DownloadRoot.get() or "/"
 end
 
+-- The account the offline library is keyed by, as the catalog keys it.
+local function offlineAccount(plugin)
+    local ok, client = pcall(plugin.newClient, plugin)
+    return ok and client and OfflineLibrary.accountKey(client) or nil
+end
+
+local function offlineQueueCount(page)
+    local all = page.plugin.settings.offline_download_queue
+    local queue = type(all) == "table" and all[offlineAccount(page.plugin) or ""] or nil
+    return type(queue) == "table" and #queue or 0
+end
+
+-- What the offline library holds, in a line: off, saving, never saved, or
+-- how many books and when.
+local function offlineSummary(page)
+    local settings = page.plugin.settings
+    if settings.offline_library == false then return _("Off") end
+    local catalog = page.catalog
+    local progress = catalog and catalog.offline_progress
+    if progress then return T(_("Saving… %1 books so far"), progress.count or 0) end
+    local status = type(settings.offline_library_status) == "table" and settings.offline_library_status or nil
+    if status and status.account ~= offlineAccount(page.plugin) then status = nil end
+    if not status then return _("Not saved yet") end
+    local when = MenuUI.ago(status.saved_at) or _("earlier")
+    if status.truncated then
+        return T(_("Newest %1 of %2 books · saved %3"), status.count or 0, status.total or 0, when)
+    end
+    return T(_("%1 books · saved %2"), status.count or 0, when)
+end
+
+-- Removes the saved library when no catalog is open to do it.
+local function clearOfflineLibrary(plugin, catalog)
+    if catalog and catalog.offlineClear then return catalog:offlineClear() end
+    local account = offlineAccount(plugin)
+    if account then pcall(OfflineLibrary.clear, account) end
+    plugin.settings.offline_library_status = nil
+    G_reader_settings:flush()
+end
+
+-- Redraws the page as a save progresses; the page checks it is still open.
+local function watchOfflineSave(page, catalog)
+    catalog.offline_progress_listener = function()
+        if not page.closed then page:refresh() end
+    end
+end
+
 local function folderName(path)
     local name = tostring(path or ""):gsub("/+$", ""):match("([^/]+)$")
     return name or path
@@ -95,6 +142,7 @@ local CATEGORIES = {
     { id = "sync", icon = "refresh-cw", label = function() return _("Sync") end, sub = function(page) return syncSummary(page.plugin.settings) end },
     { id = "home", icon = "layout-grid", label = function() return _("Home") end, sub = function(page) return homeSummary(page.plugin.settings) end },
     { id = "downloads", icon = "download", label = function() return _("Downloads") end, sub = function() return folderName(downloadDir()) end },
+    { id = "offline", icon = "cloud-off", label = function() return _("Offline") end, sub = function(page) return offlineSummary(page) end },
 }
 
 local function titleOf(view)
@@ -400,6 +448,44 @@ local function downloadsBody(page, w, embedded)
     }
 end
 
+local function offlineBody(page, w, embedded)
+    local settings = page.plugin.settings
+    local catalog = page.catalog
+    local iw = MenuUI.rowsIn(w)
+    local on = settings.offline_library ~= false
+    local saving = catalog and catalog.offline_progress ~= nil
+    local queued = offlineQueueCount(page)
+    local size_labels = {}
+    for index, size in ipairs(OfflineLibrary.SIZES) do size_labels[index] = tostring(size) end
+    local keep = MenuUI.group(w, {
+        MenuUI.row(iw, { label = _("Keep the library offline"), sub = _("Books, authors, series and shelves stay browsable without Wi-Fi"), sublines = 2,
+            toggle = on, action = { kind = "offline-toggle" } }),
+    })
+    local size = segRow(iw, _("Books to keep"), _("The newest of each library, plus every book on this device"), size_labels,
+        indexOf(OfflineLibrary.SIZES, OfflineLibrary.normalizeSize(settings.offline_library_size), 2),
+        function(index) return { kind = "offline-size", value = OfflineLibrary.SIZES[index] } end)
+    size._no_icon = true
+    local actions = MenuUI.group(w, {
+        MenuUI.row(iw, { icon = "refresh-cw", label = _("Save the library now"), sub = offlineSummary(page), sub_data = true,
+            chevron = on and not saving, action = { kind = (on and not saving) and "offline-refresh" or "noop" } }),
+        MenuUI.row(iw, { icon = "download", label = _("Queued downloads"),
+            sub = queued > 0 and T(_("%1 waiting for a connection"), queued) or _("Books chosen offline download when you connect"),
+            chevron = queued > 0, action = { kind = queued > 0 and "offline-queue" or "noop" } }),
+        MenuUI.row(iw, { icon = "trash", label = _("Clear the offline library"), sub = _("It is saved again when Home refreshes"), action = { kind = "offline-clear" } }),
+    })
+    return {
+        embedded and text(_("Offline"), { s = 18, b = true, w = w }) or false,
+        embedded and space(nil, px(12)) or false,
+        keep,
+        space(nil, px(16)),
+        MenuUI.section(w, _("Size"), MenuUI.group(w, { size }, { inset = 0 })),
+        space(nil, px(16)),
+        actions,
+        space(nil, px(12)),
+        MenuUI.card(w, { space(nil, px(12)), text(_("The library is saved in the background after Home refreshes while connected, at most every few hours. Offline, lists show what was saved, books on this device open, and any other book can be queued to download later."), { s = 13, col = INK.g4, w = iw, lines = 6, bg = INK.ge }), space(nil, px(12)) }, { fill = true }),
+    }
+end
+
 -- Test connection says how its last run went in place.
 local function testRow(page)
     local t = page.test
@@ -473,7 +559,7 @@ local function aboutBody(page, w, embedded)
     }
 end
 
-local BODIES = { opening = openingBody, home = homeBody, downloads = downloadsBody, account = accountBody, about = aboutBody }
+local BODIES = { opening = openingBody, home = homeBody, downloads = downloadsBody, offline = offlineBody, account = accountBody, about = aboutBody }
 
 local function bodyFor(page, view, w, avail, embedded)
     if view == "sync" then return syncBody(page, w, avail, embedded) end
@@ -881,6 +967,58 @@ local function onAction(page, action)
         end)
     elseif kind == "download-dir" then
         plugin:chooseDownloadFolder(catalog, function() page:refresh() end)
+    elseif kind == "offline-toggle" then
+        local on = settings.offline_library ~= false
+        settings.offline_library = not on
+        G_reader_settings:flush()
+        if on then
+            clearOfflineLibrary(plugin, catalog)
+        elseif catalog and catalog.offlineSnapshotStart then
+            watchOfflineSave(page, catalog)
+            catalog:offlineSnapshotSchedule(0)
+        end
+        page:refresh()
+    elseif kind == "offline-size" then
+        if settings.offline_library_size == action.value then return true end
+        settings.offline_library_size = action.value
+        G_reader_settings:flush()
+        page:refresh()
+    elseif kind == "offline-refresh" then
+        -- Saving is an explicit ask, so it may turn Wi-Fi on. Without an open
+        -- catalog one is opened for it: the save runs inside the catalog.
+        local NetworkMgr = require("ui/network/manager")
+        if catalog and catalog.offlineSnapshotStart then
+            NetworkMgr:runWhenConnected(function()
+                if page.closed then return end
+                watchOfflineSave(page, catalog)
+                catalog:offlineSnapshotStart({ manual = true })
+                page:refresh()
+            end)
+        else
+            NetworkMgr:runWhenConnected(function()
+                page:close()
+                plugin:browseCatalog(false)
+                UIManager:nextTick(function()
+                    local opened = plugin.catalog_browser
+                    if opened and opened.offlineSnapshotStart then opened:offlineSnapshotStart({ manual = true }) end
+                end)
+            end)
+        end
+    elseif kind == "offline-queue" then
+        if catalog and catalog.offlineOfferQueuedDownloads then
+            require("ui/network/manager"):runWhenConnected(function()
+                page:close()
+                catalog.offline_queue_offered = nil
+                UIManager:nextTick(function() catalog:offlineOfferQueuedDownloads() end)
+            end)
+        else
+            require("bookorbit_toast").show(_("Open BookOrbit to download the queued books"), { icon = "info" })
+        end
+    elseif kind == "offline-clear" then
+        confirm(_("Clear the offline library?"), _("Lists and search stop working offline until it is saved again. Books on this device stay."), _("Clear"), function()
+            clearOfflineLibrary(plugin, catalog)
+            page:refresh()
+        end, "trash")
     elseif kind == "server" then
         plugin:setServerAddress(function() page:refresh() end)
     elseif kind == "test" then

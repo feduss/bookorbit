@@ -35,6 +35,10 @@ local catalog = setmetatable({ on_device = { [40] = "c", [3] = "a", [12] = "b", 
 function catalog:refreshOnDevice() return maps_ready end
 function catalog:isOnDevice(book) return files[book.id] == true end
 function catalog:runConnected(fn) fn() end
+-- The catalog's loadBooks, without the offline library in front of it.
+function catalog:loadBooks(params, title, push)
+    self:runConnected(function() self:fetchBookPage(params, title, push) end)
+end
 function catalog:persistSetting() end
 function catalog:updateItems() redrawn = true end
 function catalog:fetchBookPage(params, title)

@@ -451,7 +451,10 @@ function DetailData.primary(state, usable, other)
         end
         return { kind = "none", icon = "x", labels = { _("No file KOReader can open"), _("Unavailable") } }
     end
-    if state.offline then return { kind = "offline", icon = "cloud-off", labels = { _("Download when online"), _("Offline") } } end
+    if state.offline then
+        if state.queued then return { kind = "queued", icon = "check", labels = { _("Queued for download"), _("Queued") } } end
+        return { kind = "offline", icon = "cloud-off", labels = { _("Download when online"), _("Offline") } }
+    end
     -- The format rides the label only when there is a choice to make.
     local choice = #usable > 1
     local labels = {}
@@ -699,6 +702,7 @@ function DetailData.build(catalog, context, now)
         status = d.status,
         pct = d.pct,
         offline = not d.online,
+        queued = catalog.offlineIsQueued ~= nil and catalog:offlineIsQueued(detail.id) or false,
         downloading = context.downloading,
     }, d.usable, d.other)
 

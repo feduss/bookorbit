@@ -429,6 +429,15 @@ function MainMenu:openBookDetails(book_id)
     end
 end
 
+-- KOReader's own menu, over whatever BookOrbit page is open. Closing it
+-- returns to that page.
+function MainMenu:showKOReaderMenu()
+    local menu = self.ui and self.ui.menu
+    if menu and menu.onShowMenu then
+        menu:onShowMenu()
+    end
+end
+
 -- What the sheet does with a tap it does not handle itself.
 function MainMenu:onMenuSheetAction(page, catalog, action)
     local kind = action.kind
@@ -471,6 +480,8 @@ function MainMenu:onMenuSheetAction(page, catalog, action)
         end)
     elseif kind == "settings" then
         after(function() self:openSettings(catalog) end)
+    elseif kind == "koreader-menu" then
+        after(function() self:showKOReaderMenu() end)
     elseif kind == "status" then
         after(function() self:openSyncStatus() end)
     elseif kind == "about" then
@@ -705,6 +716,19 @@ end
 function MainMenu:clearAccountCaches()
     self.settings.catalog_dashboard_cache = nil
     self.settings.catalog_detail_cache = nil
+    -- The offline library and the download queue belong to the account too.
+    local OfflineLibrary = require("bookorbit_offline_library")
+    local ok, client = pcall(self.newClient, self)
+    local account = ok and client and OfflineLibrary.accountKey(client) or nil
+    if account then
+        pcall(OfflineLibrary.clear, account)
+        local queue = self.settings.offline_download_queue
+        if type(queue) == "table" then
+            queue[account] = nil
+            if next(queue) == nil then self.settings.offline_download_queue = nil end
+        end
+    end
+    self.settings.offline_library_status = nil
 end
 
 function MainMenu:logout(menu)

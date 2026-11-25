@@ -110,6 +110,10 @@ BookOrbit.default_settings = {
     ui_scale = 1.05,
     catalog_dashboard_cache = nil,
     catalog_detail_cache = nil,
+    offline_library = true,
+    offline_library_size = 2000,
+    offline_library_status = nil,
+    offline_download_queue = nil,
     update_check_last_at = 0,
 }
 
